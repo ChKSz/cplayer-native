@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { findActiveLyricIndex } from '../services/lyrics';
+import { getAdjacentIndices } from '../services/queueOrder';
 import { triggerHaptic } from '../services/transport';
 import {
   getPreciseAudioTime,
@@ -151,7 +152,7 @@ function LyricRow({
   );
 }
 
-/** Minimalist white NetEase-style tonearm SVG anchored above the vinyl platter. */
+/** Minimalist white NetEase-style tonearm SVG proportionally anchored to --vinyl-size. */
 function VinylTonearm({ engaged }: { engaged: boolean }) {
   return (
     <div
@@ -159,22 +160,23 @@ function VinylTonearm({ engaged }: { engaged: boolean }) {
       data-testid="vinyl-tonearm"
       aria-hidden="true"
     >
-      <svg viewBox="0 0 120 130" width="120" height="130" fill="none">
+      <svg viewBox="0 0 186 204" width="100%" height="100%" fill="none">
         {/* Pivot collar */}
-        <circle cx="24" cy="20" r="13" fill="rgba(255,255,255,0.14)" />
-        <circle cx="24" cy="20" r="7" fill="#ffffff" />
+        <circle cx="26" cy="22" r="14" fill="rgba(255,255,255,0.20)" />
+        <circle cx="26" cy="22" r="7.5" fill="#ffffff" />
         {/* Curved white tonearm shaft */}
         <path
-          d="M24 20 L35 76 Q38 89 49 97 L66 108"
+          d="M 26 22 L 54 106 Q 58 119 70 127 L 95 144"
           stroke="#ffffff"
-          strokeWidth="4.2"
+          strokeWidth="5.2"
           strokeLinecap="round"
           strokeLinejoin="round"
         />
-        {/* Stylus cartridge head */}
-        <g transform="translate(65 107) rotate(34)">
-          <rect x="-4" y="-5" width="22" height="10" rx="3" fill="#ffffff" />
-          <line x1="12" y1="-2" x2="12" y2="2" stroke="rgba(17,19,24,0.45)" strokeWidth="1.6" strokeLinecap="round" />
+        {/* Stylus cartridge head resting squarely on black vinyl groove when engaged */}
+        <g data-testid="tonearm-stylus" transform="translate(101 148) rotate(34)">
+          <rect x="-11" y="-6.5" width="24" height="13" rx="3.2" fill="#ffffff" />
+          <line x1="6" y1="-3.5" x2="6" y2="3.5" stroke="rgba(18,20,26,0.45)" strokeWidth="1.5" strokeLinecap="round" />
+          <line x1="9.5" y1="-3.5" x2="9.5" y2="3.5" stroke="rgba(18,20,26,0.45)" strokeWidth="1.5" strokeLinecap="round" />
         </g>
       </svg>
     </div>
@@ -235,14 +237,13 @@ export function PlayerPage() {
     [lyrics, displayTime],
   );
 
-  // Adjacent tracks for 3-disc carousel
+  // Adjacent tracks for 3-disc carousel (1:1 parity with playPrev/playNext)
   const { prevTrack, nextTrack } = useMemo(() => {
     if (queue.length <= 1 || currentIndex < 0) {
       return { prevTrack: currentTrack, nextTrack: currentTrack };
     }
-    const p = (currentIndex - 1 + queue.length) % queue.length;
-    const n = (currentIndex + 1) % queue.length;
-    return { prevTrack: queue[p], nextTrack: queue[n] };
+    const { prevIndex, nextIndex } = getAdjacentIndices(queue.length, currentIndex);
+    return { prevTrack: queue[prevIndex], nextTrack: queue[nextIndex] };
   }, [queue, currentIndex, currentTrack]);
 
   // Synchronize external store `showLyrics` changes (e.g., Android back button) to 3D flipAngle
@@ -414,12 +415,23 @@ export function PlayerPage() {
     settling: boolean;
   } | null>(null);
 
-  const setDiscTrackPosition = (offsetPx: number, animated = false) => {
+  const pendingSnapResetRef = useRef(false);
+
+  const setDiscTrackPosition = useCallback((offsetPx: number, animated = false) => {
     const el = discTrackRef.current;
     if (!el) return;
     el.style.transition = animated ? 'transform 280ms cubic-bezier(0.22, 1, 0.36, 1)' : 'none';
-    el.style.transform = `translate3d(calc(-33.3333% + ${offsetPx.toFixed(2)}px), 0, 0)`;
-  };
+    el.style.transform = `translate3d(calc(-33.333333% + ${offsetPx.toFixed(2)}px), 0, 0)`;
+  }, []);
+
+  // Reset carousel to center synchronously after React renders the newly active track cover (zero flash)
+  useLayoutEffect(() => {
+    if (pendingSnapResetRef.current) {
+      pendingSnapResetRef.current = false;
+      setDiscTrackPosition(0, false);
+      setDraggingDisc(false);
+    }
+  }, [currentIndex, currentTrack?.id, setDiscTrackPosition]);
 
   const onDiscPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (discDragRef.current?.settling) return;
@@ -498,10 +510,17 @@ export function PlayerPage() {
       setDiscTrackPosition(targetOffset, true);
       setTimeout(() => {
         discDragRef.current = null;
+        pendingSnapResetRef.current = true;
         if (goNext) void playNext();
         else void playPrev();
-        setDiscTrackPosition(0, false);
-        setDraggingDisc(false);
+        // Fallback reset in case track index didn't change (e.g. 1-song edge case)
+        requestAnimationFrame(() => {
+          if (pendingSnapResetRef.current) {
+            pendingSnapResetRef.current = false;
+            setDiscTrackPosition(0, false);
+            setDraggingDisc(false);
+          }
+        });
       }, 270);
       return;
     }
@@ -577,38 +596,40 @@ export function PlayerPage() {
             onPointerUp={(e) => finishDiscGesture(e, false)}
             onPointerCancel={(e) => finishDiscGesture(e, true)}
           >
-            <VinylTonearm engaged={armEngaged} />
+            <div className="vinyl-stage-box">
+              <VinylTonearm engaged={armEngaged} />
 
-            <div className="disc-carousel-viewport">
-              <div ref={discTrackRef} className="disc-track">
-                {/* Prev Disc */}
-                <div className="disc-slot">
-                  <div className="vinyl-platter">
-                    <div className="vinyl-disc">
-                      <div className="vinyl-cover">
-                        <img src={trackCoverOrFallback(prevTrack)} alt="" draggable={false} />
+              <div className="disc-carousel-viewport">
+                <div ref={discTrackRef} className="disc-track">
+                  {/* Prev Disc */}
+                  <div className="disc-slot" data-testid="disc-slot-prev">
+                    <div className="vinyl-platter">
+                      <div className="vinyl-disc">
+                        <div className="vinyl-cover">
+                          <img src={trackCoverOrFallback(prevTrack)} alt="" draggable={false} />
+                        </div>
                       </div>
                     </div>
                   </div>
-                </div>
 
-                {/* Current Active Disc (NO center spindle hole!) */}
-                <div className="disc-slot">
-                  <div className="vinyl-platter">
-                    <div className={`vinyl-disc ${armEngaged ? 'playing' : ''}`}>
-                      <div className="vinyl-cover">
-                        <img src={trackCoverOrFallback(currentTrack)} alt="" draggable={false} />
+                  {/* Current Active Disc (NO center spindle hole!) */}
+                  <div className="disc-slot" data-testid="disc-slot-current">
+                    <div className="vinyl-platter" data-testid="vinyl-platter-current">
+                      <div className={`vinyl-disc ${armEngaged ? 'playing' : ''}`} data-testid="vinyl-disc-current">
+                        <div className="vinyl-cover" data-testid="vinyl-cover-current">
+                          <img src={trackCoverOrFallback(currentTrack)} alt="" draggable={false} />
+                        </div>
                       </div>
                     </div>
                   </div>
-                </div>
 
-                {/* Next Disc */}
-                <div className="disc-slot">
-                  <div className="vinyl-platter">
-                    <div className="vinyl-disc">
-                      <div className="vinyl-cover">
-                        <img src={trackCoverOrFallback(nextTrack)} alt="" draggable={false} />
+                  {/* Next Disc */}
+                  <div className="disc-slot" data-testid="disc-slot-next">
+                    <div className="vinyl-platter">
+                      <div className="vinyl-disc">
+                        <div className="vinyl-cover">
+                          <img src={trackCoverOrFallback(nextTrack)} alt="" draggable={false} />
+                        </div>
                       </div>
                     </div>
                   </div>

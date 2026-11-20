@@ -40,7 +40,10 @@ export function getSheetHeaderMeta(): { title: string; subtitle: string } {
     case 'queue':
       return {
         title: '当前播放队列',
-        subtitle: `${st.queue.length} 首`,
+        subtitle:
+          st.playMode === 'random'
+            ? `${st.queue.length} 首 · 随机打乱队列`
+            : `${st.queue.length} 首`,
       };
     case 'quality':
       return {
@@ -74,10 +77,12 @@ export function getSheetHeaderMeta(): { title: string; subtitle: string } {
 
 function QueueSheetBody() {
   const queue = usePlayerStore((s) => s.queue);
+  const playMode = usePlayerStore((s) => s.playMode);
   const currentTrack = usePlayerStore((s) => s.currentTrack);
   const currentIndex = usePlayerStore((s) => s.currentIndex);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
-  const playTrackList = usePlayerStore((s) => s.playTrackList);
+  const playQueueIndex = usePlayerStore((s) => s.playQueueIndex);
+  const reshuffleQueue = usePlayerStore((s) => s.reshuffleQueue);
   const closeSheet = usePlayerStore((s) => s.closeSheet);
 
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -117,6 +122,33 @@ function QueueSheetBody() {
 
   return (
     <div ref={listRef} style={{ position: 'relative', paddingBottom: 140 }}>
+      {playMode === 'random' && queue.length > 1 && (
+        <div
+          className="sheet-card"
+          data-testid="shuffle-queue-hint"
+          style={{
+            marginBottom: 10,
+            padding: '9px 12px',
+            borderRadius: 14,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 10,
+          }}
+        >
+          <span style={{ fontSize: 12, color: 'var(--ink-2)', lineHeight: 1.4 }}>
+            随机播放已打乱当前队列，左右滑唱片将按此顺序切歌
+          </span>
+          <button
+            type="button"
+            className="pill-btn tap"
+            style={{ height: 28, padding: '0 10px', fontSize: 11.5, flexShrink: 0 }}
+            onClick={() => reshuffleQueue()}
+          >
+            重新洗牌
+          </button>
+        </div>
+      )}
       {queue.map((track, idx) => {
         const isCur =
           idx === activeIdx ||
@@ -128,7 +160,7 @@ function QueueSheetBody() {
             ref={isCur ? activeRowRef : null}
             className={`track-row tap-soft ${isCur ? 'playing' : ''}`}
             onClick={() => {
-              void playTrackList(queue, idx);
+              void playQueueIndex(idx);
               closeSheet();
             }}
           >
@@ -462,8 +494,8 @@ function AccountSheetBody({ onRequestExpand }: { onRequestExpand?: () => void })
           onChange={(v) => setPreference('showRomaji', v)}
         />
         <ToggleRow
-          title="柔和流体背景"
-          subtitle="关闭可定格封面流光更省电"
+          title="动态流体背景"
+          subtitle="CPlayer 原版流光背景，关闭可省电"
           checked={fluidMotion}
           onChange={(v) => setPreference('fluidMotion', v)}
         />

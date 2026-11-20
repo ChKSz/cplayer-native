@@ -69,12 +69,12 @@ export class FluidBackgroundEngine {
         tuv.y *= 1.0 / ratio;
         tuv *= Rot(radians((degree - 0.5) * 720.0 + 180.0));
         tuv.y *= ratio;
-        float frequency = 3.4, amplitude = 26.0, speed = uTime * 1.6;
+        float frequency = 5.0, amplitude = 30.0, speed = uTime * 2.0;
         tuv.x += sin(tuv.y * frequency + speed) / amplitude;
         tuv.y += sin(tuv.x * frequency * 1.5 + speed) / (amplitude * 0.5);
-        vec3 layer1 = mix(uColor1, uColor2, S(-0.55, 0.45, (tuv * Rot(radians(-5.0))).x));
-        vec3 layer2 = mix(uColor3, uColor4, S(-0.55, 0.45, (tuv * Rot(radians(-5.0))).x));
-        gl_FragColor = vec4(mix(layer1, layer2, S(0.68, -0.50, tuv.y)), 1.0);
+        vec3 layer1 = mix(uColor1, uColor2, S(-0.3, 0.2, (tuv * Rot(radians(-5.0))).x));
+        vec3 layer2 = mix(uColor3, uColor4, S(-0.3, 0.2, (tuv * Rot(radians(-5.0))).x));
+        gl_FragColor = vec4(mix(layer1, layer2, S(0.5, -0.3, tuv.y)), 1.0);
       }
     `;
 
@@ -156,7 +156,7 @@ export class FluidBackgroundEngine {
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.useProgram(this.program);
     gl.uniform2f(this.uResolution, this.canvas.width, this.canvas.height);
-    gl.uniform1f(this.uTime, this.timeAccumulator * 0.0003);
+    gl.uniform1f(this.uTime, this.timeAccumulator * 0.0005);
 
     const [c1, c2, c3, c4] = this.currentColors;
     gl.uniform3f(this.uColor1, c1[0] / 255, c1[1] / 255, c1[2] / 255);

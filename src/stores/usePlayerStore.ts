@@ -5,6 +5,11 @@ import { MusicService } from '../services/musicApi';
 import { PlayerAuth } from '../services/playerAuth';
 import { parseLyrics } from '../services/lyrics';
 import {
+  getAdjacentIndices,
+  restoreOriginalOrder,
+  shuffleQueueKeepingCurrent,
+} from '../services/queueOrder';
+import {
   getCachedLyric,
   getCachedPlaylist,
   setCachedLyric,
@@ -124,6 +129,7 @@ export interface PlayerStoreState {
 
   // Playback
   queue: Track[];
+  originalQueue: Track[];
   currentIndex: number;
   currentTrack: Track | null;
   currentSongData: SongPlaybackData | null;
@@ -179,6 +185,8 @@ export interface PlayerStoreState {
 
   // Playback
   playTrackList: (tracks: Track[], index: number, meta?: { kind?: 'cloud' | 'netease'; playlistId?: string | null; sourceId?: string | null }) => Promise<void>;
+  playQueueIndex: (index: number) => Promise<void>;
+  reshuffleQueue: () => void;
   playTrackNow: (track: Track) => Promise<void>;
   playNextInQueue: (track: Track) => void;
   togglePlay: () => Promise<void>;
@@ -378,6 +386,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     loadingPlaylist: false,
 
     queue: [],
+    originalQueue: [],
     currentIndex: -1,
     currentTrack: null,
     currentSongData: null,
@@ -439,12 +448,18 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
             : pb.trackIndex;
           if (tracks.length > 0) {
             const safeIdx = idx >= 0 && idx < tracks.length ? idx : 0;
+            const restoredOrder =
+              get().playMode === 'random' && tracks.length > 1
+                ? shuffleQueueKeepingCurrent(tracks, safeIdx)
+                : { queue: tracks, currentIndex: safeIdx };
             set({
-              queue: tracks,
-              currentIndex: safeIdx,
-              currentTrack: tracks[safeIdx],
+              originalQueue: tracks,
+              queue: restoredOrder.queue,
+              currentIndex: restoredOrder.currentIndex,
+              currentTrack: restoredOrder.queue[restoredOrder.currentIndex],
             });
-            void extractFluidPalette(tracks[safeIdx].cover, `${tracks[safeIdx].id}-${tracks[safeIdx].name}`).then(
+            const cur = restoredOrder.queue[restoredOrder.currentIndex];
+            void extractFluidPalette(cur.cover, `${cur.id}-${cur.name}`).then(
               (palette) => set({ fluidPalette: palette }),
             );
           }
@@ -695,18 +710,48 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     playTrackList: async (tracks, index, meta) => {
       if (!tracks.length) return;
       const safeIdx = Math.max(0, Math.min(tracks.length - 1, index));
+      const isRandom = get().playMode === 'random' && tracks.length > 1;
+      const nextOrder = isRandom
+        ? shuffleQueueKeepingCurrent(tracks, safeIdx)
+        : { queue: [...tracks], currentIndex: safeIdx };
       set({
-        queue: tracks,
-        currentIndex: safeIdx,
+        originalQueue: [...tracks],
+        queue: nextOrder.queue,
+        currentIndex: nextOrder.currentIndex,
         ...(meta?.kind === 'cloud'
           ? { activeCloudPlaylistId: meta.playlistId ?? get().activeCloudPlaylistId }
           : {}),
       });
-      await loadSongAt(tracks[safeIdx], 0);
+      if (isRandom) {
+        get().showToast('随机播放 · 已按随机顺序打乱列表');
+      }
+      await loadSongAt(nextOrder.queue[nextOrder.currentIndex], 0);
+    },
+
+    playQueueIndex: async (index) => {
+      const { queue } = get();
+      if (!queue.length) return;
+      const safeIdx = Math.max(0, Math.min(queue.length - 1, index));
+      set({ currentIndex: safeIdx });
+      await loadSongAt(queue[safeIdx], 0);
+    },
+
+    reshuffleQueue: () => {
+      const { queue, originalQueue, currentIndex } = get();
+      if (queue.length <= 1) return;
+      const baseOriginal = originalQueue.length ? originalQueue : [...queue];
+      const shuffled = shuffleQueueKeepingCurrent(queue, currentIndex);
+      set({
+        originalQueue: baseOriginal,
+        queue: shuffled.queue,
+        currentIndex: shuffled.currentIndex,
+      });
+      get().showToast('已重新随机打乱播放列表');
     },
 
     playTrackNow: async (track) => {
       const q = [...get().queue];
+      const orig = [...get().originalQueue];
       const existingIdx = q.findIndex((t) => String(t.id) === String(track.id));
       if (existingIdx >= 0) {
         set({ currentIndex: existingIdx });
@@ -714,13 +759,17 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       } else {
         const insertAt = get().currentIndex >= 0 ? get().currentIndex + 1 : 0;
         q.splice(insertAt, 0, track);
-        set({ queue: q, currentIndex: insertAt });
+        if (!orig.some((t) => String(t.id) === String(track.id))) {
+          orig.push(track);
+        }
+        set({ queue: q, originalQueue: orig, currentIndex: insertAt });
         await loadSongAt(track, 0);
       }
     },
 
     playNextInQueue: (track) => {
       const q = [...get().queue];
+      const orig = [...get().originalQueue];
       const curIdx = get().currentIndex;
       const existing = q.findIndex((t) => String(t.id) === String(track.id));
       if (existing >= 0 && existing !== curIdx) {
@@ -731,7 +780,10 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       );
       const insertAt = nextCurIdx >= 0 ? nextCurIdx + 1 : q.length;
       q.splice(insertAt, 0, track);
-      set({ queue: q, currentIndex: nextCurIdx >= 0 ? nextCurIdx : curIdx });
+      if (!orig.some((t) => String(t.id) === String(track.id))) {
+        orig.push(track);
+      }
+      set({ queue: q, originalQueue: orig, currentIndex: nextCurIdx >= 0 ? nextCurIdx : curIdx });
       get().showToast(`已添加到下一首播放 · ${track.name}`);
     },
 
@@ -762,33 +814,21 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     },
 
     playPrev: async () => {
-      const { queue, currentIndex, playMode } = get();
+      const { queue, currentIndex } = get();
       if (!queue.length) return;
-      let nextIdx: number;
-      if (playMode === 'random' && queue.length > 1) {
-        do {
-          nextIdx = Math.floor(Math.random() * queue.length);
-        } while (nextIdx === currentIndex);
-      } else {
-        nextIdx = (currentIndex - 1 + queue.length) % queue.length;
-      }
-      set({ currentIndex: nextIdx });
-      await loadSongAt(queue[nextIdx], 0);
+      const { prevIndex } = getAdjacentIndices(queue.length, currentIndex);
+      if (prevIndex < 0) return;
+      set({ currentIndex: prevIndex });
+      await loadSongAt(queue[prevIndex], 0);
     },
 
     playNext: async () => {
-      const { queue, currentIndex, playMode } = get();
+      const { queue, currentIndex } = get();
       if (!queue.length) return;
-      let nextIdx: number;
-      if (playMode === 'random' && queue.length > 1) {
-        do {
-          nextIdx = Math.floor(Math.random() * queue.length);
-        } while (nextIdx === currentIndex);
-      } else {
-        nextIdx = (currentIndex + 1) % queue.length;
-      }
-      set({ currentIndex: nextIdx });
-      await loadSongAt(queue[nextIdx], 0);
+      const { nextIndex } = getAdjacentIndices(queue.length, currentIndex);
+      if (nextIndex < 0) return;
+      set({ currentIndex: nextIndex });
+      await loadSongAt(queue[nextIndex], 0);
     },
 
     seekTo: (time) => {
@@ -796,9 +836,42 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     },
 
     cyclePlayMode: () => {
-      const cur = get().playMode;
+      const { playMode: cur, queue, originalQueue, currentIndex, currentTrack } = get();
       const next = MODE_ORDER[(MODE_ORDER.indexOf(cur) + 1) % MODE_ORDER.length];
       localStorage.setItem('cp_play_mode', next);
+
+      if (next === 'random') {
+        const snapshot = originalQueue.length ? originalQueue : [...queue];
+        const shuffled = shuffleQueueKeepingCurrent(queue, currentIndex);
+        set({
+          playMode: next,
+          originalQueue: snapshot,
+          queue: shuffled.queue,
+          currentIndex: shuffled.currentIndex,
+        });
+        get().showToast(
+          queue.length > 1
+            ? '随机播放 · 已打乱播放列表顺序'
+            : '播放模式 · 随机播放',
+        );
+        return;
+      }
+
+      if (cur === 'random' && originalQueue.length > 0) {
+        const restored = restoreOriginalOrder(originalQueue, queue, currentTrack);
+        set({
+          playMode: next,
+          queue: restored.queue,
+          currentIndex: restored.currentIndex,
+        });
+        get().showToast(
+          next === 'single'
+            ? '单曲循环 · 已恢复原歌单顺序'
+            : '列表循环 · 已恢复原歌单顺序',
+        );
+        return;
+      }
+
       set({ playMode: next });
       const labels: Record<PlayMode, string> = {
         sequence: '列表循环',
