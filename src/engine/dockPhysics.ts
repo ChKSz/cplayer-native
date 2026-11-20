@@ -96,24 +96,43 @@ export function computeCapsuleDragPos(params: {
 }
 
 /**
- * Computes edge-safe liquid glass pill stretch (scaleX, scaleY).
- * Tapers stretch down to 1.0 near the outer edges (0 and maxIndex) so the pill
- * NEVER clips awkwardly against the outer capsule's border-radius!
+ * Computes edge-safe liquid glass pill stretch (scaleX, scaleY) plus press inflation.
+ * Matches Hachimi's `BlurBottomBar.kt`: pressing inflates the droplet smoothly above
+ * and below the outer pill, while velocity adds elastic stretch that tapers near edges.
  */
 export function computeLiquidStretch(
   pos: number,
   velocitySlotsPerSec: number,
   maxIndex: number,
+  pressProgress = 0,
 ): { scaleX: number; scaleY: number } {
   const edgeDist = Math.min(Math.max(0, pos), Math.max(0, maxIndex - pos));
-  // Full stretch in interior (>= 0.25 slots from edge), softly tapered to 0.25x at edges
   const edgeFactor = 0.25 + 0.75 * Math.min(1, edgeDist / 0.25);
   const speed = Math.min(Math.abs(velocitySlotsPerSec), 12);
-  const stretch = Math.min(speed * 0.015, 0.13) * edgeFactor;
+  const velStretch = Math.min(speed * 0.015, 0.14) * edgeFactor;
+  const p = Math.max(0, Math.min(1, pressProgress));
+
+  const baseX = 1 + 0.18 * p;
+  const baseY = 1 + 0.30 * p;
   return {
-    scaleX: 1 + stretch,
-    scaleY: 1 - stretch * 0.38,
+    scaleX: baseX * (1 + velStretch),
+    scaleY: baseY * (1 - velStretch * 0.32),
   };
+}
+
+/**
+ * Computes gentle rubber-band panel shift (px) matching Hachimi's `offsetAnimation`
+ * so the whole floating bar responds subtly to the user's horizontal drag.
+ */
+export function computePanelRubberBand(
+  dxPx: number,
+  totalWidthPx: number,
+  maxShiftPx = 4.5,
+): number {
+  if (totalWidthPx <= 0) return 0;
+  const fraction = Math.max(-1, Math.min(1, dxPx / totalWidthPx));
+  const eased = 1 - Math.pow(1 - Math.abs(fraction), 2);
+  return maxShiftPx * Math.sign(fraction) * eased;
 }
 
 /**

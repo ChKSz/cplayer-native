@@ -1,4 +1,4 @@
-import { useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { trackCoverOrFallback, usePlayerStore } from '../stores/usePlayerStore';
 import { songSourceOf } from '../types/music';
 import { IconMore, IconPlus } from './Icons';
@@ -22,17 +22,18 @@ export function PlaylistPage() {
   const listRef = useRef<HTMLDivElement | null>(null);
   const activeRowRef = useRef<HTMLDivElement | null>(null);
 
-  const hasCurrentInList =
-    currentTrack !== null &&
-    activePlaylistTracks.some((t) => String(t.id) === String(currentTrack.id));
-
-  const locateCurrentTrack = () => {
-    const scroller = listRef.current;
-    const row = activeRowRef.current;
-    if (!scroller || !row) return;
-    const targetTop = row.offsetTop - scroller.clientHeight * 0.35;
-    scroller.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
-  };
+  // Automatically locate the currently playing track when opening/switching a playlist
+  useEffect(() => {
+    if (!currentTrack) return;
+    const t = setTimeout(() => {
+      const scroller = listRef.current;
+      const row = activeRowRef.current;
+      if (!scroller || !row) return;
+      const targetTop = row.offsetTop - scroller.clientHeight * 0.25;
+      scroller.scrollTo({ top: Math.max(0, targetTop), behavior: 'auto' });
+    }, 60);
+    return () => clearTimeout(t);
+  }, [activePlaylistKey, activePlaylistTracks.length, currentTrack?.id]);
 
   const statusText = !user
     ? '点击登录'
@@ -46,21 +47,11 @@ export function PlaylistPage() {
     <section className="page" data-page="1">
       <div className="page-header">
         <h2 className="page-title">歌单</h2>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          {hasCurrentInList && (
-            <button
-              type="button"
-              className="pill-btn tap"
-              onClick={locateCurrentTrack}
-            >
-              定位在播
-            </button>
-          )}
-          <button
-            type="button"
-            className="pill-btn tap"
-            onClick={() => openSheet('account')}
-          >
+        <button
+          type="button"
+          className="pill-btn tap"
+          onClick={() => openSheet('account')}
+        >
           <span
             style={{
               width: 6,
@@ -75,7 +66,6 @@ export function PlaylistPage() {
           />
           <span>{statusText}</span>
         </button>
-        </div>
       </div>
 
       {/* Horizontal Cloud Playlist & NetEase ID Import Chips (NO local JSON import) */}

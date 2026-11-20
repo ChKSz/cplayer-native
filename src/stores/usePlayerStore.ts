@@ -42,7 +42,33 @@ const playerAuth = new PlayerAuth();
 export const cpSync = new CPSync();
 export const musicService = new MusicService(playerAuth);
 
+export type SleepTimerMode = 'off' | '15' | '30' | '60' | 'track';
+
+export type PreferenceKey =
+  | 'showVerbatim'
+  | 'showTranslation'
+  | 'showRomaji'
+  | 'fluidMotion';
+
+const PREF_STORAGE_KEYS: Record<PreferenceKey, string> = {
+  showVerbatim: 'cp_lyric_yrc',
+  showTranslation: 'cp_lyric_trans',
+  showRomaji: 'cp_lyric_roma',
+  fluidMotion: 'cp_fluid_motion',
+};
+
+function readBoolPref(key: PreferenceKey, fallback = true): boolean {
+  try {
+    const val = localStorage.getItem(PREF_STORAGE_KEYS[key]);
+    if (val === null) return fallback;
+    return val !== '0' && val !== 'false';
+  } catch {
+    return fallback;
+  }
+}
+
 let audioEngine: AudioEngine | null = null;
+let sleepTimeoutId: ReturnType<typeof setTimeout> | null = null;
 let songRequestSeq = 0;
 let activeSongAbort: AbortController | null = null;
 let searchAbort: AbortController | null = null;
@@ -111,6 +137,14 @@ export interface PlayerStoreState {
   lyrics: LyricLine[];
   fluidPalette: FluidPalette;
 
+  // Preferences & Sleep Timer
+  showVerbatim: boolean;
+  showTranslation: boolean;
+  showRomaji: boolean;
+  fluidMotion: boolean;
+  sleepTimerMode: SleepTimerMode;
+  sleepTimerEndsAt: number | null;
+
   // Search
   searchSource: MusicSource;
   searchQuery: string;
@@ -130,7 +164,10 @@ export interface PlayerStoreState {
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string, inviteCode?: string) => Promise<void>;
   logout: () => Promise<void>;
+  refreshCloudPlaylists: () => Promise<void>;
   updateEndpoints: (apiBase: string, syncApi: string) => void;
+  setPreference: (key: PreferenceKey, value: boolean) => void;
+  setSleepTimer: (mode: SleepTimerMode) => void;
 
   // Playlists
   selectCloudPlaylist: (id: string, force?: boolean) => Promise<void>;
@@ -177,6 +214,12 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       onBufferingChange: (isBuffering) => set({ isBuffering }),
       onEnded: () => {
         const st = get();
+        if (st.sleepTimerMode === 'track') {
+          set({ sleepTimerMode: 'off', sleepTimerEndsAt: null, isPlaying: false });
+          audioEngine?.pause();
+          st.showToast('本首播完，睡眠定时已暂停播放');
+          return;
+        }
         if (st.playMode === 'single') {
           audioEngine?.seek(0);
           void audioEngine?.play();
@@ -348,6 +391,13 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     lyrics: [],
     fluidPalette: DEFAULT_FLUID_PALETTE,
 
+    showVerbatim: readBoolPref('showVerbatim', true),
+    showTranslation: readBoolPref('showTranslation', true),
+    showRomaji: readBoolPref('showRomaji', true),
+    fluidMotion: readBoolPref('fluidMotion', true),
+    sleepTimerMode: 'off',
+    sleepTimerEndsAt: null,
+
     searchSource: (localStorage.getItem('cp_search_source') as MusicSource) || 'wy',
     searchQuery: '',
     searchResults: [],
@@ -444,11 +494,62 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       get().showToast('已退出登录');
     },
 
+    refreshCloudPlaylists: async () => {
+      try {
+        await cpSync.refreshAll();
+        set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+        const curCloudId = get().activeCloudPlaylistId;
+        if (curCloudId) {
+          await get().selectCloudPlaylist(curCloudId, true);
+        }
+        get().showToast('云歌单已同步');
+      } catch (err) {
+        get().showToast(err instanceof Error ? err.message : '同步失败');
+      }
+    },
+
     updateEndpoints: (apiBase, syncApi) => {
       musicService.setBaseUrl(apiBase);
       cpSync.setBaseUrl(syncApi);
       playerAuth.setSyncBase(cpSync.baseUrl);
       get().showToast('接口地址已更新');
+    },
+
+    setPreference: (key, value) => {
+      try {
+        localStorage.setItem(PREF_STORAGE_KEYS[key], value ? '1' : '0');
+      } catch {
+        // Ignore storage error
+      }
+      set({ [key]: value } as Partial<PlayerStoreState>);
+    },
+
+    setSleepTimer: (mode) => {
+      if (sleepTimeoutId) {
+        clearTimeout(sleepTimeoutId);
+        sleepTimeoutId = null;
+      }
+      if (mode === 'off') {
+        set({ sleepTimerMode: 'off', sleepTimerEndsAt: null });
+        get().showToast('已关闭睡眠定时');
+        return;
+      }
+      if (mode === 'track') {
+        set({ sleepTimerMode: 'track', sleepTimerEndsAt: null });
+        get().showToast('播完当前歌曲后将自动暂停');
+        return;
+      }
+      const minutes = parseInt(mode, 10);
+      const ms = minutes * 60_000;
+      const endsAt = Date.now() + ms;
+      set({ sleepTimerMode: mode, sleepTimerEndsAt: endsAt });
+      sleepTimeoutId = setTimeout(() => {
+        sleepTimeoutId = null;
+        audioEngine?.pause();
+        set({ sleepTimerMode: 'off', sleepTimerEndsAt: null, isPlaying: false });
+        get().showToast('睡眠定时已到达，已暂停播放');
+      }, ms);
+      get().showToast(`已开启 ${minutes} 分钟睡眠定时`);
     },
 
     selectCloudPlaylist: async (id, force = false) => {
@@ -779,5 +880,6 @@ export function getPlayerAuthCredentialSnapshot() {
 }
 
 export function getPreciseAudioTime(): number {
-  return audioEngine ? audioEngine.getPreciseCurrentTime() : usePlayerStore.getState().currentTime;
+  const engineTime = audioEngine ? audioEngine.getPreciseCurrentTime() : 0;
+  return engineTime > 0 ? engineTime : usePlayerStore.getState().currentTime;
 }

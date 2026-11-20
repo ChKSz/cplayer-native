@@ -35,7 +35,6 @@ export function SearchPage() {
     <section className="page" data-page="2">
       <div className="page-header">
         <h2 className="page-title">搜索</h2>
-        <span className="sheet-sub">多音源 · 成员直连</span>
       </div>
 
       <form

@@ -9,12 +9,12 @@ import {
 import { QUALITY_OPTIONS, songSourceOf, type LyricLine } from '../types/music';
 import {
   IconChevronDown,
-  IconLyrics,
   IconMore,
   IconNext,
   IconPause,
   IconPlay,
   IconPrev,
+  IconQueue,
   IconRepeat,
   IconUser,
 } from './Icons';
@@ -29,39 +29,45 @@ interface LyricRowProps {
   line: LyricLine;
   index: number;
   activeIndex: number;
+  focusedIndex: number;
   displayTime: number;
   isScrubbing: boolean;
   isPlaying: boolean;
   showLyrics: boolean;
   userBrowsing: boolean;
-  onSeek: (time: number) => void;
+  showVerbatim: boolean;
+  showTranslation: boolean;
+  showRomaji: boolean;
   setRef: (el: HTMLDivElement | null) => void;
 }
 
 /**
  * Renders one lyric line.
- * When `line.words` (YRC verbatim syllables) is present on the active line, runs a
- * zero-React-rerender 60fps RAF loop updating `--word-p` and `data-state` directly on spans.
+ * When `showVerbatim` & `line.words` are enabled on the active line, runs a zero-React-rerender
+ * 60fps RAF loop updating `--word-p` and `data-state` directly on syllable spans.
  */
 function LyricRow({
   line,
   index,
   activeIndex,
+  focusedIndex,
   displayTime,
   isScrubbing,
   isPlaying,
   showLyrics,
   userBrowsing,
-  onSeek,
+  showVerbatim,
+  showTranslation,
+  showRomaji,
   setRef,
 }: LyricRowProps) {
   const isActive = index === activeIndex;
+  const isFocused = userBrowsing && index === focusedIndex;
   const isPast = activeIndex >= 0 && index < activeIndex;
   const dist = activeIndex >= 0 ? Math.abs(index - activeIndex) : 0;
   const wordRefs = useRef<(HTMLSpanElement | null)[]>([]);
-  const downPosRef = useRef<{ x: number; y: number } | null>(null);
 
-  const hasWords = Boolean(line.words && line.words.length > 0);
+  const hasWords = Boolean(showVerbatim && line.words && line.words.length > 0);
 
   useEffect(() => {
     if (!hasWords || !line.words) return;
@@ -113,27 +119,16 @@ function LyricRow({
 
   const depthClass = isActive
     ? 'active'
-    : !userBrowsing && dist >= 3
-      ? 'far'
-      : !userBrowsing && dist === 2
-        ? 'mid'
-        : '';
+    : isFocused
+      ? 'focused'
+      : !userBrowsing && dist >= 3
+        ? 'far'
+        : !userBrowsing && dist === 2
+          ? 'mid'
+          : '';
 
   return (
-    <div
-      ref={setRef}
-      className={`lyric-line ${depthClass}`}
-      onPointerDown={(e) => {
-        downPosRef.current = { x: e.clientX, y: e.clientY };
-      }}
-      onClick={(e) => {
-        e.stopPropagation();
-        const dp = downPosRef.current;
-        if (dp && Math.hypot(e.clientX - dp.x, e.clientY - dp.y) > 10) return;
-        onSeek(line.time);
-        void triggerHaptic('selection');
-      }}
-    >
+    <div ref={setRef} className={`lyric-line ${depthClass}`}>
       <div className="lyric-main">
         {hasWords && line.words
           ? line.words.map((w, wi) => (
@@ -150,13 +145,45 @@ function LyricRow({
             ))
           : line.text}
       </div>
-      {line.romaji && <span className="lrc-romaji">{line.romaji}</span>}
-      {line.translation && <span className="tlrc">{line.translation}</span>}
+      {showRomaji && line.romaji && <span className="lrc-romaji">{line.romaji}</span>}
+      {showTranslation && line.translation && <span className="tlrc">{line.translation}</span>}
+    </div>
+  );
+}
+
+/** Minimalist white NetEase-style tonearm SVG anchored above the vinyl platter. */
+function VinylTonearm({ engaged }: { engaged: boolean }) {
+  return (
+    <div
+      className={`vinyl-tonearm ${engaged ? 'engaged' : ''}`}
+      data-testid="vinyl-tonearm"
+      aria-hidden="true"
+    >
+      <svg viewBox="0 0 120 130" width="120" height="130" fill="none">
+        {/* Pivot collar */}
+        <circle cx="24" cy="20" r="13" fill="rgba(255,255,255,0.14)" />
+        <circle cx="24" cy="20" r="7" fill="#ffffff" />
+        {/* Curved white tonearm shaft */}
+        <path
+          d="M24 20 L35 76 Q38 89 49 97 L66 108"
+          stroke="#ffffff"
+          strokeWidth="4.2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        {/* Stylus cartridge head */}
+        <g transform="translate(65 107) rotate(34)">
+          <rect x="-4" y="-5" width="22" height="10" rx="3" fill="#ffffff" />
+          <line x1="12" y1="-2" x2="12" y2="2" stroke="rgba(17,19,24,0.45)" strokeWidth="1.6" strokeLinecap="round" />
+        </g>
+      </svg>
     </div>
   );
 }
 
 export function PlayerPage() {
+  const queue = usePlayerStore((s) => s.queue);
+  const currentIndex = usePlayerStore((s) => s.currentIndex);
   const currentTrack = usePlayerStore((s) => s.currentTrack);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
   const isBuffering = usePlayerStore((s) => s.isBuffering);
@@ -169,6 +196,9 @@ export function PlayerPage() {
   const showLyrics = usePlayerStore((s) => s.showLyrics);
   const user = usePlayerStore((s) => s.user);
   const syncStatus = usePlayerStore((s) => s.syncStatus);
+  const showVerbatim = usePlayerStore((s) => s.showVerbatim);
+  const showTranslation = usePlayerStore((s) => s.showTranslation);
+  const showRomaji = usePlayerStore((s) => s.showRomaji);
 
   const setShowLyrics = usePlayerStore((s) => s.setShowLyrics);
   const togglePlay = usePlayerStore((s) => s.togglePlay);
@@ -180,16 +210,17 @@ export function PlayerPage() {
 
   const [scrubTime, setScrubTime] = useState<number | null>(null);
   const [userBrowsing, setUserBrowsing] = useState(false);
+  const [focusedLineIdx, setFocusedLineIdx] = useState(0);
+  const [draggingDisc, setDraggingDisc] = useState(false);
+  const [flipAngle, setFlipAngle] = useState(() => (showLyrics ? 180 : 0));
 
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const discTrackRef = useRef<HTMLDivElement | null>(null);
   const lyricsBoxRef = useRef<HTMLDivElement | null>(null);
   const lineRefs = useRef<(HTMLDivElement | null)[]>([]);
   const progressRef = useRef<HTMLDivElement | null>(null);
 
-  const swipeStartRef = useRef<{ x: number; y: number } | null>(null);
-  const vinylDownRef = useRef<{ x: number; y: number } | null>(null);
   const lyricsDownRef = useRef<{ x: number; y: number } | null>(null);
-
   const programmaticScrollRef = useRef(false);
   const scrollAnimRafRef = useRef<number | null>(null);
   const progScrollClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -204,6 +235,37 @@ export function PlayerPage() {
     [lyrics, displayTime],
   );
 
+  // Adjacent tracks for 3-disc carousel
+  const { prevTrack, nextTrack } = useMemo(() => {
+    if (queue.length <= 1 || currentIndex < 0) {
+      return { prevTrack: currentTrack, nextTrack: currentTrack };
+    }
+    const p = (currentIndex - 1 + queue.length) % queue.length;
+    const n = (currentIndex + 1) % queue.length;
+    return { prevTrack: queue[p], nextTrack: queue[n] };
+  }, [queue, currentIndex, currentTrack]);
+
+  // Synchronize external store `showLyrics` changes (e.g., Android back button) to 3D flipAngle
+  useEffect(() => {
+    setFlipAngle((prev) => {
+      const isBackShowing = Math.abs(Math.round(prev / 180)) % 2 === 1;
+      if (isBackShowing === showLyrics) return prev;
+      return prev + 180;
+    });
+  }, [showLyrics]);
+
+  const flipStage = useCallback(
+    (clientX?: number) => {
+      const rect = stageRef.current?.getBoundingClientRect();
+      const goRight =
+        rect && typeof clientX === 'number' ? clientX >= rect.left + rect.width / 2 : true;
+      setFlipAngle((a) => a + (goRight ? 180 : -180));
+      setShowLyrics(!showLyrics);
+      void triggerHaptic('selection');
+    },
+    [setShowLyrics, showLyrics],
+  );
+
   const cancelScrollAnim = useCallback(() => {
     if (scrollAnimRafRef.current !== null) {
       cancelAnimationFrame(scrollAnimRafRef.current);
@@ -216,10 +278,6 @@ export function PlayerPage() {
     programmaticScrollRef.current = false;
   }, []);
 
-  /**
-   * Custom smooth RAF scroll on ONLY `.lyrics-box` (never calls `scrollIntoView()`,
-   * which would scroll `.player-stage` horizontally inside the 200% carousel).
-   */
   const animateScrollTop = useCallback(
     (box: HTMLDivElement, rawTargetTop: number, durationMs = 460) => {
       cancelScrollAnim();
@@ -270,21 +328,18 @@ export function PlayerPage() {
   const scrollToActiveRef = useRef(scrollToActiveLyric);
   scrollToActiveRef.current = scrollToActiveLyric;
 
-  // Defensively ensure stage horizontal scroll never drifts, and snap lyrics when opened
+  // Center active lyric cleanly whenever 3D-flipping onto lyrics face
   useEffect(() => {
-    if (stageRef.current) {
-      stageRef.current.scrollLeft = 0;
-    }
+    if (stageRef.current) stageRef.current.scrollLeft = 0;
     if (showLyrics) {
       setUserBrowsing(false);
       if (userIdleTimerRef.current) clearTimeout(userIdleTimerRef.current);
-      const t = setTimeout(() => scrollToActiveRef.current(0), 50);
+      const t = setTimeout(() => scrollToActiveRef.current(0), 60);
       return () => clearTimeout(t);
     }
     return undefined;
   }, [showLyrics]);
 
-  // Reset browse state on track change
   useEffect(() => {
     cancelScrollAnim();
     setUserBrowsing(false);
@@ -298,7 +353,6 @@ export function PlayerPage() {
     }
   }, [currentTrack?.id, cancelScrollAnim]);
 
-  // Auto-follow active lyric whenever playing progresses or user idle auto-resumes
   useEffect(() => {
     if (!showLyrics || userBrowsing || activeLyricIdx < 0) return;
     scrollToActiveRef.current(460);
@@ -311,19 +365,150 @@ export function PlayerPage() {
     };
   }, [cancelScrollAnim]);
 
+  const computeCenterLineIndex = () => {
+    const box = lyricsBoxRef.current;
+    if (!box || !lyrics.length) return 0;
+    const targetY = box.scrollTop + box.clientHeight * 0.42;
+    let bestIdx = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < lyrics.length; i++) {
+      const el = lineRefs.current[i];
+      if (!el) continue;
+      const mid = el.offsetTop + el.clientHeight / 2;
+      const d = Math.abs(mid - targetY);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  };
+
   const scheduleAutoResume = () => {
     cancelScrollAnim();
     setUserBrowsing(true);
+    setFocusedLineIdx(computeCenterLineIndex());
     if (userIdleTimerRef.current) clearTimeout(userIdleTimerRef.current);
     userIdleTimerRef.current = setTimeout(() => {
       if (touchingLyricsRef.current) return;
       setUserBrowsing(false);
-    }, 2200);
+    }, 2000);
   };
 
   const handleLyricsUserScroll = () => {
     if (programmaticScrollRef.current) return;
     scheduleAutoResume();
+  };
+
+  // ================= 3-Disc Horizontal Drag-to-Skip + Tap-to-Flip =================
+  const discDragRef = useRef<{
+    id: number;
+    startX: number;
+    startY: number;
+    lastX: number;
+    lastTime: number;
+    velX: number;
+    dragging: boolean;
+    captured: boolean;
+    width: number;
+    settling: boolean;
+  } | null>(null);
+
+  const setDiscTrackPosition = (offsetPx: number, animated = false) => {
+    const el = discTrackRef.current;
+    if (!el) return;
+    el.style.transition = animated ? 'transform 280ms cubic-bezier(0.22, 1, 0.36, 1)' : 'none';
+    el.style.transform = `translate3d(calc(-33.3333% + ${offsetPx.toFixed(2)}px), 0, 0)`;
+  };
+
+  const onDiscPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (discDragRef.current?.settling) return;
+    const width = e.currentTarget.getBoundingClientRect().width || 352;
+    discDragRef.current = {
+      id: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      lastX: e.clientX,
+      lastTime: performance.now(),
+      velX: 0,
+      dragging: false,
+      captured: false,
+      width,
+      settling: false,
+    };
+  };
+
+  const onDiscPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const g = discDragRef.current;
+    if (!g || g.settling || e.pointerId !== g.id) return;
+
+    const dx = e.clientX - g.startX;
+    const dy = e.clientY - g.startY;
+    const now = performance.now();
+    const dt = Math.max(1, now - g.lastTime);
+
+    if (!g.dragging && Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+      g.dragging = true;
+      setDraggingDisc(true);
+      if (!g.captured) {
+        g.captured = true;
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+          // Ignore if unavailable
+        }
+      }
+    }
+
+    if (g.dragging) {
+      const instVx = (e.clientX - g.lastX) / dt; // px/ms
+      g.velX = g.velX * 0.55 + instVx * 0.45;
+      const effectiveDx = queue.length > 1 ? dx : dx * 0.24;
+      setDiscTrackPosition(effectiveDx, false);
+    }
+
+    g.lastX = e.clientX;
+    g.lastTime = now;
+  };
+
+  const finishDiscGesture = (e: React.PointerEvent<HTMLDivElement>, canceled = false) => {
+    const g = discDragRef.current;
+    if (!g || g.settling || e.pointerId !== g.id) return;
+
+    const dx = e.clientX - g.startX;
+    const dy = e.clientY - g.startY;
+    const dist = Math.hypot(dx, dy);
+
+    if (!g.dragging) {
+      discDragRef.current = null;
+      if (!canceled && dist <= 10) {
+        flipStage(e.clientX);
+      }
+      return;
+    }
+
+    const canSkip = queue.length > 1;
+    const goNext = canSkip && !canceled && (dx < -Math.min(82, g.width * 0.24) || g.velX < -0.5);
+    const goPrev = canSkip && !canceled && (dx > Math.min(82, g.width * 0.24) || g.velX > 0.5);
+
+    if (goNext || goPrev) {
+      g.settling = true;
+      void triggerHaptic('light');
+      const targetOffset = goNext ? -g.width : g.width;
+      setDiscTrackPosition(targetOffset, true);
+      setTimeout(() => {
+        discDragRef.current = null;
+        if (goNext) void playNext();
+        else void playPrev();
+        setDiscTrackPosition(0, false);
+        setDraggingDisc(false);
+      }, 270);
+      return;
+    }
+
+    discDragRef.current = null;
+    setDiscTrackPosition(0, true);
+    setTimeout(() => setDraggingDisc(false), 260);
   };
 
   const src = songSourceOf(currentTrack?.id);
@@ -340,7 +525,8 @@ export function PlayerPage() {
     return r * duration;
   };
 
-  const teaserLine = activeLyricIdx >= 0 ? lyrics[activeLyricIdx] : null;
+  const armEngaged = isPlaying && !draggingDisc && !showLyrics;
+  const focusedLine = lyrics[focusedLineIdx];
 
   return (
     <section className="page" data-page="0">
@@ -358,7 +544,7 @@ export function PlayerPage() {
         <button
           type="button"
           className="icon-btn tap"
-          aria-label="账号与云同步"
+          aria-label="我的与设置"
           onClick={() => openSheet('account')}
         >
           <IconUser size={18} />
@@ -370,70 +556,73 @@ export function PlayerPage() {
         </button>
       </header>
 
-      {/* Center Stage: Slide 0 (Black Vinyl) <-> Slide 1 (Verbatim Scrolling Lyrics) */}
+      {/* 3D Flip Stage: Front = White Tonearm + 3-Disc Drag Vinyl | Back = NetEase Centerline Lyrics */}
       <div
         ref={stageRef}
-        className="player-stage"
+        className="player-stage flip-scene"
         data-testid="player-stage"
-        onPointerDown={(e) => {
-          swipeStartRef.current = { x: e.clientX, y: e.clientY };
-        }}
-        onPointerUp={(e) => {
-          const st = swipeStartRef.current;
-          swipeStartRef.current = null;
-          if (!st) return;
-          const dx = e.clientX - st.x;
-          const dy = e.clientY - st.y;
-          if (Math.abs(dx) > 48 && Math.abs(dx) > Math.abs(dy) * 1.35) {
-            if (dx < 0 && !showLyrics) setShowLyrics(true);
-            if (dx > 0 && showLyrics) setShowLyrics(false);
-          }
-        }}
-        onPointerCancel={() => {
-          swipeStartRef.current = null;
-        }}
       >
-        <div className={`stage-track ${showLyrics ? 'show-lyrics' : ''}`}>
-          {/* Slide 1: Authentic Black Vinyl Disc */}
-          <div className="stage-slide" data-testid="slide-vinyl">
-            <div
-              className="vinyl-wrap tap-soft"
-              onPointerDown={(e) => {
-                vinylDownRef.current = { x: e.clientX, y: e.clientY };
-              }}
-              onClick={(e) => {
-                const d = vinylDownRef.current;
-                if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 10) return;
-                setShowLyrics(true);
-              }}
-              title="点击或左滑查看歌词"
-            >
-              <div className={`vinyl-disc ${isPlaying ? 'playing' : ''}`}>
-                <div className="vinyl-cover">
-                  <img src={trackCoverOrFallback(currentTrack)} alt="" />
-                </div>
-                <div className="vinyl-spindle" />
-              </div>
-            </div>
+        <div
+          className="flip-card"
+          data-testid="flip-card"
+          style={{ transform: `rotateY(${flipAngle}deg)` }}
+        >
+          {/* FRONT FACE: Vinyl + Tonearm */}
+          <div
+            className="flip-face flip-front"
+            data-testid="slide-vinyl"
+            style={{ pointerEvents: showLyrics ? 'none' : 'auto' }}
+            onPointerDown={onDiscPointerDown}
+            onPointerMove={onDiscPointerMove}
+            onPointerUp={(e) => finishDiscGesture(e, false)}
+            onPointerCancel={(e) => finishDiscGesture(e, true)}
+          >
+            <VinylTonearm engaged={armEngaged} />
 
-            <div
-              className="lyric-teaser tap"
-              onPointerDown={(e) => {
-                vinylDownRef.current = { x: e.clientX, y: e.clientY };
-              }}
-              onClick={(e) => {
-                const d = vinylDownRef.current;
-                if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 10) return;
-                setShowLyrics(true);
-              }}
-            >
-              {teaserLine?.text ||
-                (currentTrack ? '轻点黑胶查看歌词' : '在歌单或搜索中选歌播放')}
+            <div className="disc-carousel-viewport">
+              <div ref={discTrackRef} className="disc-track">
+                {/* Prev Disc */}
+                <div className="disc-slot">
+                  <div className="vinyl-platter">
+                    <div className="vinyl-disc">
+                      <div className="vinyl-cover">
+                        <img src={trackCoverOrFallback(prevTrack)} alt="" draggable={false} />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Current Active Disc (NO center spindle hole!) */}
+                <div className="disc-slot">
+                  <div className="vinyl-platter">
+                    <div className={`vinyl-disc ${armEngaged ? 'playing' : ''}`}>
+                      <div className="vinyl-cover">
+                        <img src={trackCoverOrFallback(currentTrack)} alt="" draggable={false} />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Next Disc */}
+                <div className="disc-slot">
+                  <div className="vinyl-platter">
+                    <div className="vinyl-disc">
+                      <div className="vinyl-cover">
+                        <img src={trackCoverOrFallback(nextTrack)} alt="" draggable={false} />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
 
-          {/* Slide 2: Scrolling Verbatim YRC / LRC / TLRC Lyrics */}
-          <div className="stage-slide" data-testid="slide-lyrics" style={{ position: 'relative' }}>
+          {/* BACK FACE: Verbatim Lyrics + NetEase Centerline Scrubber */}
+          <div
+            className="flip-face flip-back"
+            data-testid="slide-lyrics"
+            style={{ pointerEvents: showLyrics ? 'auto' : 'none' }}
+          >
             <div
               ref={lyricsBoxRef}
               className="lyrics-box"
@@ -462,7 +651,7 @@ export function PlayerPage() {
               onClick={(e) => {
                 const d = lyricsDownRef.current;
                 if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 10) return;
-                setShowLyrics(false);
+                flipStage(e.clientX);
               }}
             >
               {lyrics.length > 0 ? (
@@ -472,50 +661,54 @@ export function PlayerPage() {
                     line={line}
                     index={idx}
                     activeIndex={activeLyricIdx}
+                    focusedIndex={focusedLineIdx}
                     displayTime={displayTime}
                     isScrubbing={scrubTime !== null}
                     isPlaying={isPlaying}
                     showLyrics={showLyrics}
                     userBrowsing={userBrowsing}
+                    showVerbatim={showVerbatim}
+                    showTranslation={showTranslation}
+                    showRomaji={showRomaji}
                     setRef={(el) => {
                       lineRefs.current[idx] = el;
-                    }}
-                    onSeek={(t) => {
-                      if (userIdleTimerRef.current) clearTimeout(userIdleTimerRef.current);
-                      setUserBrowsing(false);
-                      seekTo(t);
                     }}
                   />
                 ))
               ) : (
                 <div className="empty-box">
-                  <span>{currentTrack ? '暂无同步歌词' : '尚未开始播放'}</span>
-                  <span style={{ fontSize: 12, opacity: 0.6 }}>轻点空白处或右滑返回黑胶</span>
+                  <span>{currentTrack ? '纯音乐，请欣赏' : '尚未开始播放'}</span>
+                  <span style={{ fontSize: 12, opacity: 0.6 }}>轻点屏幕翻回黑胶唱片</span>
                 </div>
               )}
             </div>
 
-            {userBrowsing && lyrics.length > 0 && (
-              <button
-                type="button"
-                className="pill-btn tap lyric-resume-pill"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (userIdleTimerRef.current) clearTimeout(userIdleTimerRef.current);
-                  setUserBrowsing(false);
-                  scrollToActiveLyric(460);
-                }}
-              >
-                回到当前歌词
-              </button>
+            {/* NetEase-style centerline scrubber shown ONLY while manually browsing lyrics */}
+            {userBrowsing && lyrics.length > 0 && focusedLine && (
+              <div className="lyric-scrub-line" data-testid="lyric-scrub-line">
+                <span className="lyric-scrub-time">{fmtTime(focusedLine.time)}</span>
+                <span className="lyric-scrub-rule" />
+                <button
+                  type="button"
+                  className="lyric-scrub-play tap"
+                  aria-label="跳转到此句并播放"
+                  data-testid="lyric-scrub-play"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (userIdleTimerRef.current) clearTimeout(userIdleTimerRef.current);
+                    setUserBrowsing(false);
+                    seekTo(focusedLine.time);
+                    if (!isPlaying) void togglePlay();
+                    void triggerHaptic('light');
+                  }}
+                >
+                  <IconPlay size={12} />
+                </button>
+              </div>
             )}
           </div>
         </div>
-      </div>
-
-      <div className="stage-dots">
-        <span className={`stage-dot ${!showLyrics ? 'active' : ''}`} />
-        <span className={`stage-dot ${showLyrics ? 'active' : ''}`} />
       </div>
 
       {/* Song Metadata */}
@@ -527,7 +720,7 @@ export function PlayerPage() {
               ? `${currentTrack.artist}${currentTrack.album ? ` · ${currentTrack.album}` : ''}`
               : user
                 ? `已登录 · ${user.username}`
-                : '登录 CPlayerSync 账号解锁多音源无损'}
+                : '登录账号开启云歌单与无损聆听'}
           </p>
         </div>
         {currentTrack && (
@@ -572,7 +765,7 @@ export function PlayerPage() {
         </div>
       </div>
 
-      {/* Restrained Transport Controls */}
+      {/* Restrained Transport Controls (Slot 5 is now reliable Queue button!) */}
       <div className="controls-row">
         <button
           type="button"
@@ -631,13 +824,14 @@ export function PlayerPage() {
         <button
           type="button"
           className="ctrl-btn muted tap"
-          aria-label="切换歌词视图"
+          aria-label="播放队列"
+          data-testid="queue-btn"
           onClick={() => {
-            void triggerHaptic('selection');
-            setShowLyrics(!showLyrics);
+            void triggerHaptic('light');
+            openSheet('queue');
           }}
         >
-          <IconLyrics size={20} />
+          <IconQueue size={21} />
         </button>
       </div>
     </section>

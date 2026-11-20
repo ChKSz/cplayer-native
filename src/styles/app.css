@@ -224,7 +224,7 @@ body,
 .src-tag.qq { background: rgba(34, 197, 94, 0.22); color: #bbf7d0; }
 .src-tag.kg { background: rgba(59, 130, 246, 0.24); color: #bfdbfe; }
 
-/* ================= Player Page ================= */
+/* ================= Player Page (3D Flip + White Tonearm + 3-Disc Carousel) ================= */
 .player-stage {
   position: relative;
   flex: 1;
@@ -232,44 +232,98 @@ body,
   display: flex;
   flex-direction: column;
   justify-content: center;
-  margin: 4px 0 6px;
+  margin: 4px 0 10px;
   overflow: hidden;
   overflow: clip;
   touch-action: pan-y;
 }
 
-.stage-track {
-  display: flex;
-  width: 200%;
+.flip-scene {
+  perspective: 1200px;
+}
+
+.flip-card {
+  position: relative;
+  width: 100%;
   height: 100%;
-  transition: transform 380ms var(--ease-spring);
+  transform-style: preserve-3d;
+  transition: transform 580ms var(--ease-spring);
   will-change: transform;
 }
 
-.stage-track.show-lyrics {
-  transform: translate3d(-50%, 0, 0);
-}
-
-.stage-slide {
-  width: 50%;
-  flex-shrink: 0;
-  height: 100%;
-  overflow: hidden;
+.flip-face {
+  position: absolute;
+  inset: 0;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
 }
 
-/* Authentic CPlayer Black Vinyl Disc (No Neon Glow) */
-.vinyl-wrap {
-  position: relative;
-  width: min(272px, 68vw, 35vh);
-  height: min(272px, 68vw, 35vh);
+.flip-back {
+  transform: rotateY(180deg);
+}
+
+/* Minimalist White Tonearm SVG */
+.vinyl-tonearm {
+  position: absolute;
+  top: 4px;
+  left: calc(50% - 24px);
+  width: 120px;
+  height: 130px;
+  z-index: 6;
+  pointer-events: none;
+  transform-origin: 24px 20px;
+  transform: rotate(-28deg);
+  transition: transform 380ms var(--ease-spring);
+  will-change: transform;
+}
+
+.vinyl-tonearm.engaged {
+  transform: rotate(0deg);
+}
+
+/* 3-Disc Horizontal Drag Carousel */
+.disc-carousel-viewport {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  overflow: clip;
+  padding-top: 32px;
+}
+
+.disc-track {
+  display: flex;
+  width: 300%;
+  transform: translate3d(-33.3333%, 0, 0);
+  will-change: transform;
+}
+
+.disc-slot {
+  width: calc(100% / 3);
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* Subtle NetEase-style translucent platter ring + Black Vinyl (NO center spindle hole) */
+.vinyl-platter {
+  width: min(278px, 70vw, 36vh);
+  height: min(278px, 70vw, 36vh);
+  padding: 9px;
   border-radius: 50%;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .vinyl-disc {
@@ -277,18 +331,18 @@ body,
   height: 100%;
   border-radius: 50%;
   position: relative;
-  background-color: #111215;
+  background-color: #101115;
   background-image:
     radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.03) 0%, transparent 45%),
     repeating-radial-gradient(
       circle at 50% 50%,
-      #111216 0px,
-      #111216 2px,
-      #1d1f25 3px,
-      #131418 4.5px
+      #101115 0px,
+      #101115 2px,
+      #1c1e24 3px,
+      #121318 4.5px
     );
   border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.34), inset 0 0 18px rgba(0, 0, 0, 0.72);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.34), inset 0 0 18px rgba(0, 0, 0, 0.72);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -304,10 +358,10 @@ body,
   border-radius: 50%;
   background: conic-gradient(
     from 30deg,
-    rgba(255, 255, 255, 0.06) 0deg,
+    rgba(255, 255, 255, 0.055) 0deg,
     transparent 40deg,
     transparent 165deg,
-    rgba(255, 255, 255, 0.05) 195deg,
+    rgba(255, 255, 255, 0.045) 195deg,
     transparent 230deg,
     transparent 360deg
   );
@@ -324,12 +378,12 @@ body,
 }
 
 .vinyl-cover {
-  width: 72%;
-  height: 72%;
+  width: 68%;
+  height: 68%;
   border-radius: 50%;
   overflow: hidden;
   position: relative;
-  border: 2px solid rgba(0, 0, 0, 0.55);
+  border: 2px solid rgba(0, 0, 0, 0.45);
   z-index: 1;
 }
 
@@ -338,30 +392,6 @@ body,
   height: 100%;
   object-fit: cover;
   display: block;
-}
-
-.vinyl-spindle {
-  position: absolute;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: #141519;
-  border: 2px solid rgba(255, 255, 255, 0.16);
-  z-index: 2;
-}
-
-.lyric-teaser {
-  margin-top: 20px;
-  max-width: 92%;
-  text-align: center;
-  font-size: 13px;
-  color: var(--ink-2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  padding: 5px 13px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
 }
 
 .lyrics-box {
@@ -383,7 +413,7 @@ body,
   padding: 10px 6px;
   border-radius: 12px;
   text-align: left;
-  color: rgba(255, 255, 255, 0.42);
+  color: rgba(255, 255, 255, 0.40);
   font-size: 17px;
   font-weight: 600;
   line-height: 1.48;
@@ -393,7 +423,6 @@ body,
     opacity 320ms ease,
     transform 360ms var(--ease-spring),
     filter 320ms ease;
-  cursor: pointer;
 }
 
 .lyric-line.mid {
@@ -403,6 +432,10 @@ body,
 .lyric-line.far {
   opacity: 0.48;
   filter: blur(0.6px);
+}
+
+.lyric-line.focused {
+  color: rgba(255, 255, 255, 0.90);
 }
 
 .lyric-line.active {
@@ -477,33 +510,55 @@ body,
   opacity: 0.78;
 }
 
-.lyric-resume-pill {
+/* NetEase-style Centerline Lyric Scrubber */
+.lyric-scrub-line {
   position: absolute;
-  right: 8px;
-  bottom: 14px;
-  z-index: 4;
-  background: rgba(22, 24, 30, 0.76);
-}
-
-.stage-dots {
+  left: 0;
+  right: 0;
+  top: 42%;
+  transform: translateY(-50%);
   display: flex;
-  justify-content: center;
-  gap: 6px;
-  margin-bottom: 12px;
-  flex-shrink: 0;
+  align-items: center;
+  gap: 10px;
+  z-index: 5;
+  pointer-events: none;
 }
 
-.stage-dot {
-  width: 5px;
-  height: 5px;
+.lyric-scrub-time {
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.78);
+  padding: 2px 7px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.25);
-  transition: width 240ms var(--ease-spring), background-color 240ms ease;
+  background: rgba(20, 22, 28, 0.65);
+  backdrop-filter: blur(12px);
 }
 
-.stage-dot.active {
-  width: 16px;
-  background: rgba(255, 255, 255, 0.9);
+.lyric-scrub-rule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.24) 0%,
+    rgba(255, 255, 255, 0.12) 50%,
+    rgba(255, 255, 255, 0.24) 100%
+  );
+}
+
+.lyric-scrub-play {
+  pointer-events: auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(12px);
+  color: #ffffff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 0 0 1px;
 }
 
 .meta-row {
@@ -870,7 +925,7 @@ body,
 
 .source-opt.active { color: var(--ink); }
 
-/* ================= SIGNATURE FLOATING DRAGGABLE BOTTOM DOCK ================= */
+/* ================= HACHIMI LIQUID GLASS BOTTOM DOCK (Plan A) ================= */
 .dock-container {
   position: absolute;
   left: 16px;
@@ -879,7 +934,6 @@ body,
   z-index: 20;
   display: flex;
   align-items: center;
-  gap: 10px;
   pointer-events: none;
 }
 
@@ -887,57 +941,177 @@ body,
   pointer-events: auto;
   position: relative;
   flex: 1;
-  height: 58px;
-  padding: 5px;
+  height: 62px;
+  padding: 4px;
   border-radius: var(--radius-dock);
-  background: var(--glass-bg);
-  border: 1px solid var(--glass-border);
-  backdrop-filter: blur(28px) saturate(165%);
-  -webkit-backdrop-filter: blur(28px) saturate(165%);
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  align-items: center;
   touch-action: none;
   cursor: grab;
-  overflow: hidden;
+  overflow: visible;
+  transform-origin: center center;
+  will-change: transform;
 }
 
 .nav-capsule.dragging {
   cursor: grabbing;
 }
 
-.nav-pill {
+.nav-capsule-bg {
   position: absolute;
-  top: 5px;
-  left: 5px;
-  height: calc(100% - 10px);
-  width: calc((100% - 10px) / 3);
-  border-radius: 999px;
-  background: var(--glass-pill-active);
-  border: 1px solid rgba(255, 255, 255, 0.10);
+  inset: 0;
+  border-radius: var(--radius-dock);
+  background: rgba(18, 20, 28, 0.46);
+  backdrop-filter: blur(28px) saturate(165%);
+  -webkit-backdrop-filter: blur(28px) saturate(165%);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.26);
+  overflow: hidden;
   pointer-events: none;
-  will-change: transform;
-  transform-origin: center center;
+}
+
+/* Dual-peak directional bevel specular border (Hachimi LiquidBarHighlight) */
+.nav-capsule-bg::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  padding: 1px;
+  border-radius: inherit;
+  background: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.32) 0%,
+    rgba(255, 255, 255, 0.08) 38%,
+    rgba(255, 255, 255, 0.05) 65%,
+    rgba(255, 255, 255, 0.20) 100%
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+.nav-base-row {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  align-items: center;
+  pointer-events: none;
 }
 
 .nav-item {
-  position: relative;
-  z-index: 1;
   height: 100%;
-  color: var(--ink-2);
+  color: rgba(255, 255, 255, 0.50);
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 2px;
   font-size: 10.5px;
-  font-weight: 600;
-  pointer-events: none;
+  font-weight: 500;
+  letter-spacing: 0.01em;
   transition: color 180ms ease;
 }
 
 .nav-item.active {
-  color: var(--ink);
+  color: rgba(255, 255, 255, 0.72);
+}
+
+/* Floating Refractive Liquid Glass Droplet Lens + Synchronized Bright Portal */
+.nav-lens {
+  --press: 0;
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  height: 54px;
+  border-radius: 999px;
+  overflow: hidden;
+  z-index: 3;
+  pointer-events: none;
+  transform-origin: center center;
+  will-change: transform;
+  background: rgba(255, 255, 255, 0.13);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  transition: background-color 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+}
+
+.nav-lens.is-liquid {
+  background: rgba(16, 18, 24, 0.10);
+  border-color: transparent;
+  backdrop-filter: blur(14px) saturate(185%) brightness(1.06);
+  -webkit-backdrop-filter: blur(14px) saturate(185%) brightness(1.06);
+  box-shadow:
+    0 8px 22px rgba(0, 0, 0, 0.30),
+    inset 0 2px 6px rgba(255, 255, 255, 0.16),
+    inset 0 -3px 8px rgba(0, 0, 0, 0.22);
+}
+
+.nav-lens-portal {
+  position: relative;
+  height: 100%;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  align-items: center;
+  will-change: transform;
+}
+
+.nav-lens.is-liquid .nav-lens-portal {
+  filter: url(#liquid-glass-lens);
+}
+
+.nav-portal-item {
+  height: 100%;
+  color: #ffffff;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.nav-lens-rim {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1.2px;
+  pointer-events: none;
+  opacity: var(--press, 0);
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.72) 0%,
+    rgba(190, 224, 255, 0.28) 38%,
+    rgba(182, 168, 255, 0.14) 68%,
+    rgba(255, 255, 255, 0.42) 100%
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+}
+
+/* Plan A Detached Companion Mini-Vinyl Orb */
+.dock-orb-wrap {
+  width: 0;
+  margin-left: 0;
+  opacity: 0;
+  transform: scale(0.72);
+  pointer-events: none;
+  overflow: hidden;
+  flex-shrink: 0;
+  transition:
+    width 320ms var(--ease-spring),
+    margin-left 320ms var(--ease-spring),
+    opacity 220ms ease,
+    transform 320ms var(--ease-spring);
+}
+
+.dock-orb-wrap.visible {
+  width: 58px;
+  margin-left: 10px;
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
 }
 
 .dock-orb {
@@ -946,8 +1120,8 @@ body,
   width: 58px;
   height: 58px;
   border-radius: 50%;
-  background: var(--glass-bg);
-  border: 1px solid var(--glass-border);
+  background: rgba(18, 20, 28, 0.48);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   backdrop-filter: blur(28px) saturate(165%);
   -webkit-backdrop-filter: blur(28px) saturate(165%);
   display: flex;
@@ -965,14 +1139,6 @@ body,
   inset: 6px;
   border-radius: 50%;
   overflow: hidden;
-  opacity: 0;
-  transform: scale(0.76);
-  transition: opacity 220ms ease, transform 280ms var(--ease-spring);
-}
-
-.dock-orb.mode-mini .orb-mini-disc {
-  opacity: 1;
-  transform: scale(1);
 }
 
 .orb-mini-disc img {
@@ -996,25 +1162,10 @@ body,
   justify-content: center;
 }
 
-.orb-queue-icon {
-  transition: opacity 200ms ease, transform 240ms var(--ease-spring);
-}
-
-.dock-orb.mode-mini .orb-queue-icon {
-  opacity: 0;
-  transform: scale(0.6);
-}
-
 .orb-ring {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  opacity: 0;
-  transition: opacity 220ms ease;
-}
-
-.dock-orb.mode-mini .orb-ring {
-  opacity: 1;
 }
 
 /* ================= MULTI-DETENT DRAGGABLE BOTTOM SHEET ================= */
@@ -1161,6 +1312,155 @@ body,
   color: var(--ink);
   font-weight: 600;
   text-align: right;
+}
+
+/* ================= Miuix Settings Cards, Switches & Sleep Timer ================= */
+.miuix-card {
+  padding: 14px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.055);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.account-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.avatar-badge {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--ink);
+  flex-shrink: 0;
+}
+
+.card-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.card-label {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.card-hint {
+  font-size: 12px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.sleep-chip-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.sleep-chip {
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.sleep-chip.active {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.pref-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 6px;
+  border: none;
+  border-radius: 14px;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+
+.pref-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.pref-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.pref-sub {
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+
+.toggle-switch {
+  width: 44px;
+  height: 26px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  padding: 3px;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  transition: background-color 220ms ease;
+}
+
+.toggle-switch.on {
+  background: #ffffff;
+}
+
+.toggle-thumb {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.24);
+  transform: translateX(0);
+  transition: transform 240ms var(--ease-spring), background-color 220ms ease;
+}
+
+.toggle-switch.on .toggle-thumb {
+  background: #111318;
+  transform: translateX(18px);
+}
+
+.version-footer {
+  margin: 4px auto 0;
+  padding: 6px 14px;
+  border: none;
+  background: transparent;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  cursor: pointer;
 }
 
 /* ================= Toast ================= */

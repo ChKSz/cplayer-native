@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   computeCapsuleDragPos,
   computeLiquidStretch,
+  computePanelRubberBand,
   resolveSheetDetent,
   resolveSnapTab,
   RollingVelocity,
@@ -76,6 +77,22 @@ describe('Draggable Bottom Dock & Sheet Physics', () => {
     expect(resolveSheetDetent(300, 1200, 175, 777)).toBe('closed');
     expect(resolveSheetDetent(200, 0, 175, 777)).toBe('half');
     expect(resolveSheetDetent(520, 0, 175, 777)).toBe('closed');
+  });
+
+  it('inflates droplet lens vertically and horizontally on press while damping outer panel shift', () => {
+    const rest = computeLiquidStretch(1.0, 0, 2, 0);
+    const pressed = computeLiquidStretch(1.0, 0, 2, 1);
+    expect(rest.scaleX).toBe(1);
+    expect(rest.scaleY).toBe(1);
+    expect(pressed.scaleX).toBeCloseTo(1.18, 4);
+    expect(pressed.scaleY).toBeCloseTo(1.3, 4);
+
+    const shiftRight = computePanelRubberBand(150, 300, 4.5);
+    const shiftLeft = computePanelRubberBand(-150, 300, 4.5);
+    expect(shiftRight).toBeGreaterThan(0);
+    expect(shiftRight).toBeLessThanOrEqual(4.5);
+    expect(shiftLeft).toBeLessThan(0);
+    expect(shiftLeft).toBeGreaterThanOrEqual(-4.5);
   });
 
   it('slow one-handed pull-up from bottom dock opens reliably even with zero end velocity', () => {

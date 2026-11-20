@@ -1,5 +1,10 @@
-import { MediaRecovery } from '../services/mediaRecovery';
+import { MediaRecovery, type AudioTargetLike } from '../services/mediaRecovery';
 import type { SongPlaybackData } from '../types/music';
+import {
+  getNativeMediaApi,
+  registerNativeMediaBridge,
+  type CPlayerNativeMediaApi,
+} from './nativeMediaBridge';
 
 export interface AudioEngineCallbacks {
   onTimeUpdate: (currentTime: number, duration: number) => void;
@@ -12,33 +17,123 @@ export interface AudioEngineCallbacks {
   resolveExpiredSong: (id: string | number) => Promise<SongPlaybackData>;
 }
 
+class NativeAudioProxy extends EventTarget implements AudioTargetLike {
+  public currentTime = 0;
+  public error: MediaError | null = null;
+}
+
 /**
- * Audio playback controller wrapping HTMLAudioElement + MediaRecovery + MediaSession API.
- * Strictly keeps audio stream requests credential-free (never sends Authorization headers to CDNs).
+ * Dual-backend audio controller:
+ * - On Android APK (with Media3 ExoPlayer + MediaSessionService): delegates playback to
+ *   `window.CPlayerNativeMedia` for true background keep-alive, audio focus, lock-screen
+ *   notification controls, and hardware FLAC/Hi-Res decoding, while interpolating 60fps
+ *   timestamps for verbatim YRC lyrics.
+ * - On Web/Desktop preview: uses HTML5 `<audio>` + Web MediaSession API.
+ * Strictly keeps audio stream requests credential-free.
  */
 export class AudioEngine {
-  private audio: HTMLAudioElement;
+  private nativeApi: CPlayerNativeMediaApi | null;
+  private audio: HTMLAudioElement | null = null;
+  private unregisterBridge: (() => void) | null = null;
+
   private recovery: MediaRecovery<SongPlaybackData>;
   private currentData: SongPlaybackData | null = null;
   private callbacks: AudioEngineCallbacks;
 
+  // Native interpolation state for smooth 60fps verbatim lyrics
+  private nativePlaying = false;
+  private nativeBasePosSec = 0;
+  private nativeSyncedAtPerf = 0;
+  private nativeDurationSec = 0;
+
   constructor(callbacks: AudioEngineCallbacks) {
     this.callbacks = callbacks;
-    this.audio = new Audio();
-    // Do NOT force crossOrigin='anonymous' on audio CDNs that lack CORS headers
-    this.audio.preload = 'metadata';
+    this.nativeApi = getNativeMediaApi();
 
-    this.recovery = new MediaRecovery<SongPlaybackData>(this.audio, {
+    if (this.nativeApi) {
+      const proxy = new NativeAudioProxy();
+
+      this.recovery = new MediaRecovery<SongPlaybackData>(proxy, {
+        snapshot: () => this.currentData,
+        resolve: (id) => this.callbacks.resolveExpiredSong(id),
+        current: (snap) => this.currentData !== null && String(this.currentData.id) === String(snap.id),
+        restore: async (fresh, time, wasPlaying) => {
+          this.currentData = fresh;
+          this.nativeApi?.loadAndPlay(
+            fresh.url,
+            fresh.name || '未知歌曲',
+            fresh.artist || '未知歌手',
+            fresh.album || 'CPlayer',
+            fresh.cover || '',
+            Math.max(0, Math.round(time * 1000)),
+          );
+          if (!wasPlaying) {
+            this.nativeApi?.pause();
+          }
+        },
+        failure: (err) => {
+          const msg = err instanceof Error ? err.message : '音频链接已失效，请重试';
+          this.callbacks.onError(msg);
+        },
+      });
+
+      this.unregisterBridge = registerNativeMediaBridge({
+        onState: (playing, buffering, positionMs, durationMs) => {
+          const posSec = Math.max(0, positionMs / 1000);
+          const durSec = Math.max(0, durationMs / 1000);
+          this.nativePlaying = playing;
+          this.nativeBasePosSec = posSec;
+          this.nativeSyncedAtPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+          this.nativeDurationSec = durSec;
+
+          proxy.currentTime = posSec;
+          proxy.error = null;
+          proxy.dispatchEvent(new Event('timeupdate'));
+          proxy.dispatchEvent(new Event(playing ? 'play' : 'pause'));
+
+          this.callbacks.onBufferingChange(buffering);
+          this.callbacks.onPlayStateChange(playing);
+          this.callbacks.onTimeUpdate(posSec, durSec);
+        },
+        onEnded: () => {
+          this.nativePlaying = false;
+          this.callbacks.onEnded();
+        },
+        onError: (message) => {
+          this.nativePlaying = false;
+          this.callbacks.onBufferingChange(false);
+          const data = this.currentData;
+          if (data?.streamExpiresAt && data.streamExpiresAt <= Date.now()) {
+            proxy.error = { code: 2, message } as MediaError;
+            proxy.dispatchEvent(new Event('error'));
+            return;
+          }
+          this.callbacks.onError(message || '音频加载失败');
+        },
+        onRemoteCommand: (action) => {
+          if (action === 'prev') this.callbacks.onPrev();
+          if (action === 'next') this.callbacks.onNext();
+        },
+      });
+      return;
+    }
+
+    // Browser / Desktop HTML5 <audio> fallback
+    const audio = new Audio();
+    audio.preload = 'metadata';
+    this.audio = audio;
+
+    this.recovery = new MediaRecovery<SongPlaybackData>(audio, {
       snapshot: () => this.currentData,
       resolve: (id) => this.callbacks.resolveExpiredSong(id),
       current: (snap) => this.currentData !== null && String(this.currentData.id) === String(snap.id),
       restore: async (fresh, time, wasPlaying) => {
         this.currentData = fresh;
-        this.audio.src = fresh.url;
-        this.audio.load();
+        audio.src = fresh.url;
+        audio.load();
         await this.seekWhenReady(time);
         if (wasPlaying) {
-          await this.audio.play();
+          await audio.play();
         }
       },
       failure: (err) => {
@@ -47,47 +142,46 @@ export class AudioEngine {
       },
     });
 
-    this.bindEvents();
+    this.bindHtmlEvents(audio);
     this.setupMediaSession();
   }
 
-  private bindEvents(): void {
-    this.audio.addEventListener('timeupdate', () => {
-      const dur = Number.isFinite(this.audio.duration) ? this.audio.duration : 0;
-      this.callbacks.onTimeUpdate(this.audio.currentTime || 0, dur);
-      this.updatePositionState(this.audio.currentTime || 0, dur);
+  private bindHtmlEvents(audio: HTMLAudioElement): void {
+    audio.addEventListener('timeupdate', () => {
+      const dur = Number.isFinite(audio.duration) ? audio.duration : 0;
+      this.callbacks.onTimeUpdate(audio.currentTime || 0, dur);
+      this.updatePositionState(audio.currentTime || 0, dur);
     });
 
-    this.audio.addEventListener('loadedmetadata', () => {
-      const dur = Number.isFinite(this.audio.duration) ? this.audio.duration : 0;
-      this.callbacks.onTimeUpdate(this.audio.currentTime || 0, dur);
+    audio.addEventListener('loadedmetadata', () => {
+      const dur = Number.isFinite(audio.duration) ? audio.duration : 0;
+      this.callbacks.onTimeUpdate(audio.currentTime || 0, dur);
     });
 
-    this.audio.addEventListener('waiting', () => this.callbacks.onBufferingChange(true));
-    this.audio.addEventListener('canplay', () => this.callbacks.onBufferingChange(false));
-    this.audio.addEventListener('playing', () => {
+    audio.addEventListener('waiting', () => this.callbacks.onBufferingChange(true));
+    audio.addEventListener('canplay', () => this.callbacks.onBufferingChange(false));
+    audio.addEventListener('playing', () => {
       this.callbacks.onBufferingChange(false);
       this.callbacks.onPlayStateChange(true);
       this.setMediaSessionState('playing');
     });
 
-    this.audio.addEventListener('pause', () => {
+    audio.addEventListener('pause', () => {
       this.callbacks.onPlayStateChange(false);
       this.setMediaSessionState('paused');
     });
 
-    this.audio.addEventListener('ended', () => {
+    audio.addEventListener('ended', () => {
       this.callbacks.onEnded();
     });
 
-    this.audio.addEventListener('error', () => {
+    audio.addEventListener('error', () => {
       this.callbacks.onBufferingChange(false);
-      // If MediaRecovery handles an expired stream URL, avoid surfacing duplicate error
       const data = this.currentData;
       if (data?.streamExpiresAt && data.streamExpiresAt <= Date.now()) {
         return;
       }
-      if (this.audio.src) {
+      if (audio.src) {
         this.callbacks.onError('音频加载失败，可能该音源受限或网络异常');
       }
     });
@@ -129,7 +223,7 @@ export class AudioEngine {
       try {
         navigator.mediaSession.setPositionState({
           duration,
-          playbackRate: this.audio.playbackRate || 1,
+          playbackRate: this.audio?.playbackRate || 1,
           position: Math.min(position, duration),
         });
       } catch {
@@ -139,6 +233,7 @@ export class AudioEngine {
   }
 
   public updateMetadata(data: { name: string; artist: string; album?: string; cover?: string }): void {
+    if (this.nativeApi) return;
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator) || typeof MediaMetadata === 'undefined') {
       return;
     }
@@ -154,20 +249,21 @@ export class AudioEngine {
   }
 
   private seekWhenReady(time: number): Promise<void> {
-    if (!Number.isFinite(time) || time <= 0) return Promise.resolve();
+    const audio = this.audio;
+    if (!audio || !Number.isFinite(time) || time <= 0) return Promise.resolve();
     return new Promise((resolve) => {
       const done = () => {
         try {
-          this.audio.currentTime = time;
+          audio.currentTime = time;
         } catch {
           // Ignore seek range error
         }
         resolve();
       };
-      if (this.audio.readyState >= 1) {
+      if (audio.readyState >= 1) {
         done();
       } else {
-        this.audio.addEventListener('loadedmetadata', done, { once: true });
+        audio.addEventListener('loadedmetadata', done, { once: true });
       }
     });
   }
@@ -178,40 +274,88 @@ export class AudioEngine {
     this.callbacks.onBufferingChange(true);
     this.updateMetadata(data);
 
-    this.audio.src = data.url;
-    this.audio.load();
+    if (this.nativeApi) {
+      this.nativeBasePosSec = Math.max(0, startTime);
+      this.nativeSyncedAtPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      this.nativePlaying = false;
+      this.nativeApi.loadAndPlay(
+        data.url,
+        data.name || '未知歌曲',
+        data.artist || '未知歌手',
+        data.album || 'CPlayer',
+        data.cover || '',
+        Math.max(0, Math.round(startTime * 1000)),
+      );
+      return;
+    }
+
+    const audio = this.audio;
+    if (!audio) return;
+    audio.src = data.url;
+    audio.load();
     if (startTime > 0) {
       await this.seekWhenReady(startTime);
     }
     try {
-      await this.audio.play();
+      await audio.play();
     } catch (err) {
       this.callbacks.onBufferingChange(false);
-      // Autoplay blocked or aborted by newer track switch
       if (err instanceof DOMException && err.name === 'AbortError') return;
       throw err;
     }
   }
 
   public async play(): Promise<void> {
-    if (!this.audio.src) return;
+    if (this.nativeApi) {
+      this.nativeApi.play();
+      return;
+    }
+    if (!this.audio || !this.audio.src) return;
     await this.audio.play();
   }
 
   public pause(): void {
-    this.audio.pause();
+    if (this.nativeApi) {
+      this.nativePlaying = false;
+      this.nativeApi.pause();
+      return;
+    }
+    this.audio?.pause();
   }
 
   public getPreciseCurrentTime(): number {
-    return Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : 0;
+    if (this.nativeApi) {
+      if (!this.nativePlaying) return this.nativeBasePosSec;
+      const nowPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const elapsed = Math.max(0, (nowPerf - this.nativeSyncedAtPerf) / 1000);
+      const interpolated = this.nativeBasePosSec + elapsed;
+      return this.nativeDurationSec > 0
+        ? Math.min(this.nativeDurationSec, interpolated)
+        : interpolated;
+    }
+    return this.audio && Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : 0;
   }
 
   public seek(time: number): void {
     if (!Number.isFinite(time)) return;
-    const dur = Number.isFinite(this.audio.duration) ? this.audio.duration : 0;
+    if (this.nativeApi) {
+      const clamped =
+        this.nativeDurationSec > 0
+          ? Math.max(0, Math.min(this.nativeDurationSec, time))
+          : Math.max(0, time);
+      this.nativeBasePosSec = clamped;
+      this.nativeSyncedAtPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      this.nativeApi.seekTo(Math.round(clamped * 1000));
+      this.callbacks.onTimeUpdate(clamped, this.nativeDurationSec);
+      return;
+    }
+
+    const audio = this.audio;
+    if (!audio) return;
+    const dur = Number.isFinite(audio.duration) ? audio.duration : 0;
     const clamped = dur > 0 ? Math.max(0, Math.min(dur, time)) : Math.max(0, time);
     try {
-      this.audio.currentTime = clamped;
+      audio.currentTime = clamped;
     } catch {
       // Ignore if not loaded yet
     }
@@ -221,13 +365,23 @@ export class AudioEngine {
   public stop(): void {
     this.recovery.reset();
     this.currentData = null;
-    this.audio.pause();
-    this.audio.removeAttribute('src');
-    this.audio.load();
+    if (this.nativeApi) {
+      this.nativePlaying = false;
+      this.nativeBasePosSec = 0;
+      this.nativeDurationSec = 0;
+      this.nativeApi.stop();
+      return;
+    }
+    if (this.audio) {
+      this.audio.pause();
+      this.audio.removeAttribute('src');
+      this.audio.load();
+    }
   }
 
   public dispose(): void {
     this.recovery.dispose();
+    this.unregisterBridge?.();
     this.stop();
   }
 }
