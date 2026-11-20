@@ -306,12 +306,12 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
   const loadLyricsFor = async (id: string | number, seq: number) => {
     const cached = await getCachedLyric(id);
     if (cached && seq === songRequestSeq) {
-      set({ lyrics: parseLyrics(cached.lrc, cached.tlrc) });
+      set({ lyrics: parseLyrics(cached) });
     }
     const fetched = await musicService.getLyric(id);
     if (fetched && seq === songRequestSeq) {
-      set({ lyrics: parseLyrics(fetched.lrc, fetched.tlrc) });
-      void setCachedLyric(id, fetched.lrc, fetched.tlrc);
+      set({ lyrics: parseLyrics(fetched) });
+      void setCachedLyric(id, fetched);
     }
   };
 
@@ -776,4 +776,8 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
 
 export function getPlayerAuthCredentialSnapshot() {
   return playerAuth.getCredentialSnapshot();
+}
+
+export function getPreciseAudioTime(): number {
+  return audioEngine ? audioEngine.getPreciseCurrentTime() : usePlayerStore.getState().currentTime;
 }

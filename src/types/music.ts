@@ -47,10 +47,28 @@ export interface SongPlaybackData {
   qualityText?: string;
 }
 
+export interface LyricWord {
+  startTime: number; // seconds
+  duration: number;  // seconds
+  text: string;
+}
+
 export interface LyricLine {
   time: number;
+  duration?: number;
   text: string;
   translation: string | null;
+  romaji?: string | null;
+  words?: LyricWord[];
+}
+
+export interface LyricPayload {
+  lrc: string;
+  tlrc: string;
+  romalrc?: string;
+  yrc?: string;
+  ytlrc?: string;
+  yromalrc?: string;
 }
 
 export type SyncState = 'local' | 'dirty' | 'cloud' | 'public';

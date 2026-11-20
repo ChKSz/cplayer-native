@@ -3,6 +3,7 @@ import {
   QUALITY_OPTIONS,
   songSourceOf,
   stripSourcePrefix,
+  type LyricPayload,
   type MusicSource,
   type QualityLevel,
   type SongPlaybackData,
@@ -251,7 +252,7 @@ export class MusicService {
     };
   }
 
-  public async getLyric(id: string | number): Promise<{ lrc: string; tlrc: string } | null> {
+  public async getLyric(id: string | number): Promise<LyricPayload | null> {
     const source = songSourceOf(id);
     if (source === 'qq' || source === 'kg') {
       const key = String(id);
@@ -273,7 +274,14 @@ export class MusicService {
       const res = await this.auth.fetch(url);
       const json = await res.json();
       if (json.code === 200 && json.data) {
-        return { lrc: json.data.lrc || '', tlrc: json.data.tlyric || '' };
+        return {
+          lrc: json.data.lrc || '',
+          tlrc: json.data.tlyric || '',
+          romalrc: json.data.romalrc || '',
+          yrc: json.data.yrc || '',
+          ytlrc: json.data.ytlrc || '',
+          yromalrc: json.data.yromalrc || '',
+        };
       }
     } catch {
       // Ignore lyric fetch failure

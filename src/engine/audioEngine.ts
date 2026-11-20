@@ -202,6 +202,10 @@ export class AudioEngine {
     this.audio.pause();
   }
 
+  public getPreciseCurrentTime(): number {
+    return Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : 0;
+  }
+
   public seek(time: number): void {
     if (!Number.isFinite(time)) return;
     const dur = Number.isFinite(this.audio.duration) ? this.audio.duration : 0;

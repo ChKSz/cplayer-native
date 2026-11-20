@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FluidBackgroundEngine } from './engine/fluidBackground';
 import { DraggableBottomDock, type DockExternalSheetHooks } from './components/DraggableBottomDock';
 import { DraggableSheet, type DraggableSheetHandle } from './components/DraggableSheet';
@@ -11,11 +11,14 @@ import { usePlayerStore } from './stores/usePlayerStore';
 export function App() {
   const init = usePlayerStore((s) => s.init);
   const activeSheet = usePlayerStore((s) => s.activeSheet);
+  const currentTrack = usePlayerStore((s) => s.currentTrack);
+  const queueLen = usePlayerStore((s) => s.queue.length);
   const openSheet = usePlayerStore((s) => s.openSheet);
   const closeSheet = usePlayerStore((s) => s.closeSheet);
   const toastMessage = usePlayerStore((s) => s.toastMessage);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
   const fluidPalette = usePlayerStore((s) => s.fluidPalette);
+  const [queueLocateTick, setQueueLocateTick] = useState(0);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const fluidRef = useRef<FluidBackgroundEngine | null>(null);
@@ -123,10 +126,26 @@ export function App() {
           open={activeSheet !== null}
           title={sheetMeta.title}
           subtitle={sheetMeta.subtitle}
+          headerAction={
+            activeSheet === 'queue' && currentTrack && queueLen > 0 ? (
+              <button
+                type="button"
+                className="pill-btn tap"
+                style={{ height: 28, fontSize: 11.5 }}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => setQueueLocateTick((n) => n + 1)}
+              >
+                定位在播
+              </button>
+            ) : undefined
+          }
           initialDetent={activeSheet === 'quality' ? 'full' : 'half'}
           onClose={closeSheet}
         >
-          <SheetContentRenderer onRequestExpand={() => sheetRef.current?.expandToFull()} />
+          <SheetContentRenderer
+            locateTick={queueLocateTick}
+            onRequestExpand={() => sheetRef.current?.expandToFull()}
+          />
         </DraggableSheet>
       </div>
     </main>

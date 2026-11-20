@@ -17,6 +17,7 @@ interface DraggableSheetProps {
   open: boolean;
   title: string;
   subtitle?: string;
+  headerAction?: ReactNode;
   initialDetent?: 'half' | 'full';
   onClose: () => void;
   children: ReactNode;
@@ -31,7 +32,10 @@ interface DraggableSheetProps {
  * - Half (~64% height) <-> Full (~86% height) <-> Dismiss with velocity-aware spring snap
  */
 export const DraggableSheet = forwardRef<DraggableSheetHandle, DraggableSheetProps>(
-  function DraggableSheet({ open, title, subtitle, initialDetent = 'half', onClose, children }, ref) {
+  function DraggableSheet(
+    { open, title, subtitle, headerAction, initialDetent = 'half', onClose, children },
+    ref,
+  ) {
     const sheetRef = useRef<HTMLDivElement | null>(null);
     const backdropRef = useRef<HTMLDivElement | null>(null);
     const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -149,6 +153,7 @@ export const DraggableSheet = forwardRef<DraggableSheetHandle, DraggableSheetPro
     } | null>(null);
 
     const onHandleDown = (e: React.PointerEvent<HTMLDivElement>) => {
+      if ((e.target as HTMLElement).closest('button, a, input')) return;
       e.currentTarget.setPointerCapture(e.pointerId);
       const vel = new RollingVelocity(80, 3200);
       vel.reset(stateRef.current.offsetY, performance.now());
@@ -246,7 +251,6 @@ export const DraggableSheet = forwardRef<DraggableSheetHandle, DraggableSheetPro
           inert={!open}
           data-testid="draggable-sheet"
           style={{
-            transform: 'translate3d(0, 110%, 0)',
             pointerEvents: open ? 'auto' : 'none',
           }}
         >
@@ -260,8 +264,11 @@ export const DraggableSheet = forwardRef<DraggableSheetHandle, DraggableSheetPro
           >
             <div className="sheet-grabber" />
             <div className="sheet-header">
-              <h3 className="sheet-title">{title}</h3>
-              {subtitle && <span className="sheet-sub">{subtitle}</span>}
+              <div style={{ minWidth: 0 }}>
+                <h3 className="sheet-title">{title}</h3>
+                {subtitle && <span className="sheet-sub">{subtitle}</span>}
+              </div>
+              {headerAction}
             </div>
           </div>
           <div

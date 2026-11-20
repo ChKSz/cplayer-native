@@ -251,19 +251,28 @@ export function DraggableBottomDock({ onVisualProgress, sheetHooks }: DraggableB
   // Right Floating Orb gesture (Tap or Pull-Up Sheet)
   const orbGestureRef = useRef<{
     id: number;
+    startX: number;
     startY: number;
     draggingSheet: boolean;
   } | null>(null);
 
   const onOrbPointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
     e.currentTarget.setPointerCapture(e.pointerId);
-    orbGestureRef.current = { id: e.pointerId, startY: e.clientY, draggingSheet: false };
+    orbGestureRef.current = {
+      id: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      draggingSheet: false,
+    };
   };
 
   const onOrbPointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
     const g = orbGestureRef.current;
     if (!g || e.pointerId !== g.id) return;
-    if (!g.draggingSheet && e.clientY - g.startY < -9) {
+    const dx = e.clientX - g.startX;
+    const dy = e.clientY - g.startY;
+    // Require deliberate upward drag (-18px, vertically dominant) so finger jitter on taps never hijacks click
+    if (!g.draggingSheet && dy < -18 && Math.abs(dy) > Math.abs(dx) * 1.25) {
       g.draggingSheet = true;
       sheetHooks.beginExternalDrag('queue', e.clientY);
     }
@@ -272,7 +281,7 @@ export function DraggableBottomDock({ onVisualProgress, sheetHooks }: DraggableB
     }
   };
 
-  const finishOrbGesture = (e: React.PointerEvent<HTMLButtonElement>) => {
+  const finishOrbGesture = (e: React.PointerEvent<HTMLButtonElement>, canceled = false) => {
     const g = orbGestureRef.current;
     if (!g || e.pointerId !== g.id) return;
     orbGestureRef.current = null;
@@ -280,6 +289,7 @@ export function DraggableBottomDock({ onVisualProgress, sheetHooks }: DraggableB
       sheetHooks.endExternalDrag();
       return;
     }
+    if (canceled) return;
     void triggerHaptic('light');
     if (activeTab === 0) {
       openSheet('queue');
@@ -327,8 +337,8 @@ export function DraggableBottomDock({ onVisualProgress, sheetHooks }: DraggableB
         data-testid="dock-orb"
         onPointerDown={onOrbPointerDown}
         onPointerMove={onOrbPointerMove}
-        onPointerUp={finishOrbGesture}
-        onPointerCancel={finishOrbGesture}
+        onPointerUp={(e) => finishOrbGesture(e, false)}
+        onPointerCancel={(e) => finishOrbGesture(e, true)}
       >
         <svg className="orb-ring" viewBox="0 0 58 58">
           <circle cx="29" cy="29" r="27" fill="none" stroke="rgba(255,255,255,0.12)" strokeWidth="2" />

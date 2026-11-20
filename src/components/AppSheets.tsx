@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   cpSync,
   getPlayerAuthCredentialSnapshot,
@@ -9,12 +9,18 @@ import {
 import { QUALITY_OPTIONS, songSourceOf } from '../types/music';
 import { IconCheck } from './Icons';
 
-export function SheetContentRenderer({ onRequestExpand }: { onRequestExpand?: () => void }) {
+export function SheetContentRenderer({
+  onRequestExpand,
+  locateTick,
+}: {
+  onRequestExpand?: () => void;
+  locateTick?: number;
+}) {
   const activeSheet = usePlayerStore((s) => s.activeSheet);
 
   switch (activeSheet) {
     case 'queue':
-      return <QueueSheetBody />;
+      return <QueueSheetBody locateTick={locateTick || 0} />;
     case 'quality':
       return <QualitySheetBody />;
     case 'account':
@@ -68,12 +74,39 @@ export function getSheetHeaderMeta(): { title: string; subtitle: string } {
   }
 }
 
-function QueueSheetBody() {
+function QueueSheetBody({ locateTick }: { locateTick: number }) {
   const queue = usePlayerStore((s) => s.queue);
   const currentTrack = usePlayerStore((s) => s.currentTrack);
+  const currentIndex = usePlayerStore((s) => s.currentIndex);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
   const playTrackList = usePlayerStore((s) => s.playTrackList);
   const closeSheet = usePlayerStore((s) => s.closeSheet);
+
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const activeRowRef = useRef<HTMLDivElement | null>(null);
+
+  const activeIdx =
+    currentIndex >= 0 && currentIndex < queue.length
+      ? currentIndex
+      : currentTrack
+        ? queue.findIndex((t) => String(t.id) === String(currentTrack.id))
+        : -1;
+
+  // Scroll only the parent `.sheet-body` container directly (never scrollIntoView across animated sheets)
+  useEffect(() => {
+    if (activeIdx < 0) return;
+    const timer = setTimeout(() => {
+      const row = activeRowRef.current;
+      const scroller = listRef.current?.parentElement;
+      if (!row || !scroller) return;
+      const targetTop = row.offsetTop - scroller.clientHeight * 0.22;
+      scroller.scrollTo({
+        top: Math.max(0, targetTop),
+        behavior: locateTick > 0 ? 'smooth' : 'auto',
+      });
+    }, 60);
+    return () => clearTimeout(timer);
+  }, [activeIdx, locateTick, queue.length]);
 
   if (!queue.length) {
     return (
@@ -85,13 +118,16 @@ function QueueSheetBody() {
   }
 
   return (
-    <div>
+    <div ref={listRef} style={{ position: 'relative', paddingBottom: 140 }}>
       {queue.map((track, idx) => {
-        const isCur = currentTrack && String(currentTrack.id) === String(track.id);
+        const isCur =
+          idx === activeIdx ||
+          (currentTrack !== null && String(currentTrack.id) === String(track.id));
         const src = songSourceOf(track.id);
         return (
           <div
             key={`${track.id}-${idx}`}
+            ref={isCur ? activeRowRef : null}
             className={`track-row tap-soft ${isCur ? 'playing' : ''}`}
             onClick={() => {
               void playTrackList(queue, idx);

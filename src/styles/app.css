@@ -234,6 +234,8 @@ body,
   justify-content: center;
   margin: 4px 0 6px;
   overflow: hidden;
+  overflow: clip;
+  touch-action: pan-y;
 }
 
 .stage-track {
@@ -250,7 +252,9 @@ body,
 
 .stage-slide {
   width: 50%;
+  flex-shrink: 0;
   height: 100%;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -361,6 +365,7 @@ body,
 }
 
 .lyrics-box {
+  position: relative;
   width: 100%;
   height: 100%;
   overflow-y: auto;
@@ -369,21 +374,99 @@ body,
   mask-image: linear-gradient(180deg, transparent 0%, #000 16%, #000 84%, transparent 100%);
   -webkit-mask-image: linear-gradient(180deg, transparent 0%, #000 16%, #000 84%, transparent 100%);
   touch-action: pan-y;
+  overscroll-behavior-y: contain;
 }
 
 .lyrics-box::-webkit-scrollbar { display: none; }
 
 .lyric-line {
-  padding: 9px 6px;
+  padding: 10px 6px;
   border-radius: 12px;
   text-align: left;
-  color: rgba(255, 255, 255, 0.36);
+  color: rgba(255, 255, 255, 0.42);
   font-size: 17px;
   font-weight: 600;
-  line-height: 1.45;
+  line-height: 1.48;
   transform-origin: left center;
-  transition: color 260ms ease, transform 300ms var(--ease-spring);
+  transition:
+    color 280ms ease,
+    opacity 320ms ease,
+    transform 360ms var(--ease-spring),
+    filter 320ms ease;
   cursor: pointer;
+}
+
+.lyric-line.mid {
+  opacity: 0.72;
+}
+
+.lyric-line.far {
+  opacity: 0.48;
+  filter: blur(0.6px);
+}
+
+.lyric-line.active {
+  color: #ffffff;
+  opacity: 1;
+  filter: none;
+  transform: scale(1.055);
+}
+
+.lyric-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+
+/* Fluid verbatim YRC syllable sweep + gentle micro-float */
+.yrc-word {
+  display: inline-block;
+  white-space: pre-wrap;
+  transition: transform 220ms var(--ease-spring), color 180ms ease;
+  will-change: transform;
+}
+
+.lyric-line:not(.active) .yrc-word {
+  color: inherit;
+  background: none;
+  -webkit-text-fill-color: currentColor;
+  transform: none;
+}
+
+.lyric-line.active .yrc-word[data-state="future"] {
+  color: rgba(255, 255, 255, 0.36);
+  -webkit-text-fill-color: rgba(255, 255, 255, 0.36);
+  transform: translateY(0);
+}
+
+.lyric-line.active .yrc-word[data-state="past"] {
+  color: #ffffff;
+  -webkit-text-fill-color: #ffffff;
+  transform: translateY(-0.5px);
+}
+
+.lyric-line.active .yrc-word[data-state="active"] {
+  --word-p: 0%;
+  background-image: linear-gradient(
+    90deg,
+    #ffffff 0%,
+    #ffffff var(--word-p),
+    rgba(255, 255, 255, 0.36) calc(var(--word-p) + 14%),
+    rgba(255, 255, 255, 0.36) 100%
+  );
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  transform: translateY(-1.5px) scale(1.025);
+}
+
+.lrc-romaji {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  margin-top: 3px;
+  color: rgba(255, 255, 255, 0.52);
 }
 
 .lyric-line .tlrc {
@@ -391,12 +474,15 @@ body,
   font-size: 13px;
   font-weight: 400;
   margin-top: 3px;
-  opacity: 0.74;
+  opacity: 0.78;
 }
 
-.lyric-line.active {
-  color: #ffffff;
-  transform: scale(1.06);
+.lyric-resume-pill {
+  position: absolute;
+  right: 8px;
+  bottom: 14px;
+  z-index: 4;
+  background: rgba(22, 24, 30, 0.76);
 }
 
 .stage-dots {
@@ -961,6 +1047,7 @@ body,
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  transform: translate3d(0, 110%, 0);
   will-change: transform;
   touch-action: none;
 }

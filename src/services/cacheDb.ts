@@ -1,7 +1,7 @@
-import type { Track } from '../types/music';
+import type { LyricPayload, Track } from '../types/music';
 
 const DB_NAME = 'CPlayer5DB';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 let dbPromise: Promise<IDBDatabase | null> | null = null;
 
@@ -65,7 +65,7 @@ export async function setCachedPlaylist(id: string, name: string, songs: Track[]
 
 export async function getCachedLyric(
   songId: string | number,
-): Promise<{ lrc: string; tlrc: string } | null> {
+): Promise<LyricPayload | null> {
   const db = await openDb();
   if (!db) return null;
   return new Promise((resolve) => {
@@ -74,7 +74,18 @@ export async function getCachedLyric(
       const req = tx.objectStore('lyrics').get(String(songId));
       req.onsuccess = () => {
         const val = req.result;
-        resolve(val ? { lrc: val.lrc || '', tlrc: val.tlrc || '' } : null);
+        resolve(
+          val
+            ? {
+                lrc: val.lrc || '',
+                tlrc: val.tlrc || '',
+                romalrc: val.romalrc || '',
+                yrc: val.yrc || '',
+                ytlrc: val.ytlrc || '',
+                yromalrc: val.yromalrc || '',
+              }
+            : null,
+        );
       };
       req.onerror = () => resolve(null);
     } catch {
@@ -85,15 +96,23 @@ export async function getCachedLyric(
 
 export async function setCachedLyric(
   songId: string | number,
-  lrc: string,
-  tlrc: string,
+  payload: LyricPayload,
 ): Promise<void> {
   const db = await openDb();
   if (!db) return;
   return new Promise((resolve) => {
     try {
       const tx = db.transaction('lyrics', 'readwrite');
-      tx.objectStore('lyrics').put({ songId: String(songId), lrc, tlrc, timestamp: Date.now() });
+      tx.objectStore('lyrics').put({
+        songId: String(songId),
+        lrc: payload.lrc || '',
+        tlrc: payload.tlrc || '',
+        romalrc: payload.romalrc || '',
+        yrc: payload.yrc || '',
+        ytlrc: payload.ytlrc || '',
+        yromalrc: payload.yromalrc || '',
+        timestamp: Date.now(),
+      });
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
     } catch {
