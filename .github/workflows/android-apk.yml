@@ -47,8 +47,11 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK & NDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Default 'tools' package no longer exists in new cmdline-tools -> only install platform-tools
+          packages: 'platform-tools'
 
       - name: Install Android NDK 27
         run: |
