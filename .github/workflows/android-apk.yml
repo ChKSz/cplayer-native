@@ -21,6 +21,9 @@ permissions:
 jobs:
   build-android-apk:
     runs-on: ubuntu-24.04
+    env:
+      # Job-level env so the signing step's `if` can check it (secrets context is not allowed in step `if`)
+      KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
 
     steps:
       - name: Checkout repository
@@ -81,9 +84,8 @@ jobs:
           fi
 
       - name: Sign Release APK (optional if keystore secrets configured)
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        if: ${{ env.KEYSTORE_BASE64 != '' }}
         env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
