@@ -1,0 +1,27 @@
+[package]
+name = "cplayer-native"
+version = "1.0.0"
+description = "CPlayer Native Android Music Player built with Tauri 2"
+authors = ["CPlayer"]
+edition = "2021"
+
+[lib]
+name = "cplayer_native_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-haptics = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "deflate"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

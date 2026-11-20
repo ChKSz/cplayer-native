@@ -1,0 +1,8 @@
+node_modules/
+dist/
+dist-apk/
+src-tauri/target/
+src-tauri/gen/android/
+tsconfig.tsbuildinfo
+*.local
+.DS_Store
