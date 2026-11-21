@@ -1,13 +1,32 @@
 export interface CPlayerNativeMediaApi {
   isAvailable(): boolean;
   loadAndPlay(
+    trackId: string,
     url: string,
     title: string,
     artist: string,
     album: string,
     coverUrl: string,
     startMs: number,
+    cacheKey: string,
   ): void;
+  setNextMediaItem?: (
+    trackId: string,
+    url: string,
+    title: string,
+    artist: string,
+    album: string,
+    coverUrl: string,
+    cacheKey: string,
+  ) => void;
+  clearNextMediaItem?: () => void;
+  setRepeatOne?: (enabled: boolean) => void;
+  setSleepTimer?: (mode: string, durationMs: number) => void;
+  getSleepTimerRemainingMs?: () => number;
+  getAudioCacheBytes?: () => number;
+  clearAudioCache?: () => boolean;
+  isMeteredNetwork?: () => boolean;
+  openExternalUrl?: (url: string) => boolean;
   play(): void;
   pause(): void;
   seekTo(ms: number): void;
@@ -19,6 +38,8 @@ export interface NativeMediaCallbacks {
   onEnded: () => void;
   onError: (message: string) => void;
   onRemoteCommand: (action: 'prev' | 'next') => void;
+  onTrackTransition?: (mediaId: string) => void;
+  onSleepTimerFired?: (mode: 'timed' | 'track') => void;
 }
 
 declare global {

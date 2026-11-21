@@ -5,17 +5,19 @@ import { DraggableSheet, type DraggableSheetHandle } from './components/Draggabl
 import { PlayerPage } from './components/PlayerPage';
 import { PlaylistPage } from './components/PlaylistPage';
 import { SearchPage } from './components/SearchPage';
-import { getSheetHeaderMeta, SheetContentRenderer } from './components/AppSheets';
+import { SheetContentRenderer, useSheetHeaderMeta } from './components/AppSheets';
 import { usePlayerStore } from './stores/usePlayerStore';
 
 export function App() {
   const init = usePlayerStore((s) => s.init);
+  const activeTab = usePlayerStore((s) => s.activeTab);
   const activeSheet = usePlayerStore((s) => s.activeSheet);
   const openSheet = usePlayerStore((s) => s.openSheet);
   const closeSheet = usePlayerStore((s) => s.closeSheet);
   const toastMessage = usePlayerStore((s) => s.toastMessage);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
   const fluidMotion = usePlayerStore((s) => s.fluidMotion);
+  const fluidPowerSave = usePlayerStore((s) => s.fluidPowerSave);
   const fluidPalette = usePlayerStore((s) => s.fluidPalette);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -42,6 +44,14 @@ export function App() {
   useEffect(() => {
     fluidRef.current?.setPlaying(isPlaying && fluidMotion);
   }, [isPlaying, fluidMotion]);
+
+  useEffect(() => {
+    fluidRef.current?.setPowerSave(fluidPowerSave);
+  }, [fluidPowerSave]);
+
+  useEffect(() => {
+    fluidRef.current?.setObscured(activeTab !== 0);
+  }, [activeTab]);
 
   useEffect(() => {
     fluidRef.current?.setPalette(fluidPalette);
@@ -96,7 +106,7 @@ export function App() {
     [openSheet],
   );
 
-  const sheetMeta = getSheetHeaderMeta();
+  const sheetMeta = useSheetHeaderMeta();
 
   return (
     <main className="app-shell">
@@ -124,7 +134,7 @@ export function App() {
           open={activeSheet !== null}
           title={sheetMeta.title}
           subtitle={sheetMeta.subtitle}
-          initialDetent={activeSheet === 'quality' || activeSheet === 'account' ? 'full' : 'half'}
+          initialDetent={activeSheet === 'quality' || activeSheet === 'settings' ? 'full' : 'half'}
           onClose={closeSheet}
         >
           <SheetContentRenderer onRequestExpand={() => sheetRef.current?.expandToFull()} />

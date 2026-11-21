@@ -10,8 +10,10 @@ import {
   shuffleQueueKeepingCurrent,
 } from '../services/queueOrder';
 import {
+  clearDbCaches,
   getCachedLyric,
   getCachedPlaylist,
+  getDbCacheStats,
   setCachedLyric,
   setCachedPlaylist,
 } from '../services/cacheDb';
@@ -20,6 +22,17 @@ import {
   extractFluidPalette,
   type FluidPalette,
 } from '../services/colorExtractor';
+import {
+  buildAudioCacheKey,
+  PreloadCache,
+  resolveEffectiveQuality,
+} from '../services/preloadCache';
+import {
+  clearSearchHistory,
+  loadSearchHistory,
+  pushSearchHistory,
+  removeSearchHistoryItem,
+} from '../services/searchHistory';
 import {
   songSourceOf,
   type AuthUser,
@@ -39,42 +52,79 @@ export type ActiveSheetType =
   | 'queue'
   | 'quality'
   | 'account'
+  | 'settings'
   | 'importNetease'
   | 'createPlaylist'
+  | 'playlistManage'
   | 'trackAction';
 
-const playerAuth = new PlayerAuth();
-export const cpSync = new CPSync();
-export const musicService = new MusicService(playerAuth);
-
+export type LyricFontSize = 'sm' | 'md' | 'lg';
 export type SleepTimerMode = 'off' | '15' | '30' | '60' | 'track';
 
 export type PreferenceKey =
   | 'showVerbatim'
   | 'showTranslation'
   | 'showRomaji'
-  | 'fluidMotion';
+  | 'fluidMotion'
+  | 'fluidPowerSave'
+  | 'mobileQualityLimit'
+  | 'preloadNextEnabled'
+  | 'autoSkipFailed';
 
 const PREF_STORAGE_KEYS: Record<PreferenceKey, string> = {
   showVerbatim: 'cp_lyric_yrc',
   showTranslation: 'cp_lyric_trans',
   showRomaji: 'cp_lyric_roma',
   fluidMotion: 'cp_fluid_motion',
+  fluidPowerSave: 'cp_fluid_power_save',
+  mobileQualityLimit: 'cp_mobile_quality_limit',
+  preloadNextEnabled: 'cp_preload_next',
+  autoSkipFailed: 'cp_auto_skip_failed',
 };
 
-function readBoolPref(key: PreferenceKey, fallback = true): boolean {
+const LYRIC_SIZE_KEY = 'cp_lyric_font_size';
+const FAVORITE_PLAYLIST_NAME = '我喜欢的音乐';
+
+function safeStorageGet(key: string): string | null {
   try {
-    const val = localStorage.getItem(PREF_STORAGE_KEYS[key]);
-    if (val === null) return fallback;
-    return val !== '0' && val !== 'false';
+    return typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;
   } catch {
-    return fallback;
+    return null;
   }
 }
 
+function safeStorageSet(key: string, value: string): void {
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(key, value);
+  } catch {
+    // Ignore storage error
+  }
+}
+
+function readBoolPref(key: PreferenceKey, fallback = true): boolean {
+  const val = safeStorageGet(PREF_STORAGE_KEYS[key]);
+  if (val === null) return fallback;
+  return val !== '0' && val !== 'false';
+}
+
+function readLyricFontSize(): LyricFontSize {
+  const val = safeStorageGet(LYRIC_SIZE_KEY);
+  return val === 'sm' || val === 'lg' ? val : 'md';
+}
+
+const playerAuth = new PlayerAuth();
+export const cpSync = new CPSync();
+export const musicService = new MusicService(playerAuth);
+const preloadCache = new PreloadCache();
+
 let audioEngine: AudioEngine | null = null;
 let sleepTimeoutId: ReturnType<typeof setTimeout> | null = null;
+let sleepFadeIntervalId: ReturnType<typeof setInterval> | null = null;
+let preloadTimerId: ReturnType<typeof setTimeout> | null = null;
+let autoSkipTimerId: ReturnType<typeof setTimeout> | null = null;
 let songRequestSeq = 0;
+let lastPreloadRefreshSeq = -1;
+let consecutiveAutoSkipErrors = 0;
 let activeSongAbort: AbortController | null = null;
 let searchAbort: AbortController | null = null;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -106,6 +156,31 @@ export function trackCoverOrFallback(track: Track | null | undefined): string {
   return track.cover || makeFallbackArt(`${track.id}-${track.name}`);
 }
 
+function computeQualityBadge(songData: SongPlaybackData): string | null {
+  return (
+    songData.qualityText ||
+    (songData.level
+      ? ({
+          standard: '标准 128K',
+          higher: '较高 192K',
+          exhigh: '极高 320K',
+          lossless: '无损 FLAC',
+          hires: 'Hi-Res',
+          jyeffect: '高清臻音',
+          sky: '沉浸环绕声',
+          jymaster: '超清母带',
+        }[songData.level] ?? songData.level)
+      : null)
+  );
+}
+
+function extractNeteasePlaylistId(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (/^\d{4,}$/.test(trimmed)) return trimmed;
+  const m = trimmed.match(/[?&]id=(\d+)/) || trimmed.match(/playlist\/(\d+)/);
+  return m ? m[1] : null;
+}
+
 export interface PlayerStoreState {
   // Navigation & Sheets
   activeTab: number; // 0: Player, 1: Playlist, 2: Search
@@ -126,6 +201,8 @@ export interface PlayerStoreState {
   activeCloudPlaylistId: string | null;
   activeNeteasePlaylistId: string | null;
   loadingPlaylist: boolean;
+  favoritePlaylistId: string | null;
+  favoriteTrackIds: string[];
 
   // Playback
   queue: Track[];
@@ -142,12 +219,19 @@ export interface PlayerStoreState {
   actualQualityText: string | null;
   lyrics: LyricLine[];
   fluidPalette: FluidPalette;
+  isMeteredNetwork: boolean;
+  failedTrackOffer: Track | null;
 
   // Preferences & Sleep Timer
   showVerbatim: boolean;
   showTranslation: boolean;
   showRomaji: boolean;
   fluidMotion: boolean;
+  fluidPowerSave: boolean;
+  mobileQualityLimit: boolean;
+  preloadNextEnabled: boolean;
+  autoSkipFailed: boolean;
+  lyricFontSize: LyricFontSize;
   sleepTimerMode: SleepTimerMode;
   sleepTimerEndsAt: number | null;
 
@@ -157,6 +241,7 @@ export interface PlayerStoreState {
   searchResults: Track[];
   searching: boolean;
   searchError: string | null;
+  searchHistory: string[];
 
   // Actions
   init: () => Promise<void>;
@@ -165,30 +250,51 @@ export interface PlayerStoreState {
   openSheet: (type: ActiveSheetType, track?: Track | null) => void;
   closeSheet: () => void;
   showToast: (msg: string) => void;
+  dismissFailedOffer: () => void;
 
-  // Auth / Sync
+  // Auth / Sync / Preferences
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string, inviteCode?: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshCloudPlaylists: () => Promise<void>;
   updateEndpoints: (apiBase: string, syncApi: string) => void;
   setPreference: (key: PreferenceKey, value: boolean) => void;
+  setLyricFontSize: (size: LyricFontSize) => void;
   setSleepTimer: (mode: SleepTimerMode) => void;
+  refreshNetworkStatus: () => boolean;
+  getCacheSummary: () => Promise<{
+    audioBytes: number;
+    playlistCount: number;
+    lyricCount: number;
+  }>;
+  clearAudioCache: () => boolean;
+  clearMetadataCache: () => Promise<void>;
+  openExternalLink: (url: string) => boolean;
 
-  // Playlists
+  // Playlists & Favorites
   selectCloudPlaylist: (id: string, force?: boolean) => Promise<void>;
   importNeteasePlaylist: (input: string) => Promise<void>;
   createCloudPlaylist: (name: string) => Promise<void>;
+  renameCloudPlaylist: (id: string, name: string) => Promise<void>;
   deleteCloudPlaylist: (id: string) => Promise<void>;
+  saveNeteasePlaylistToCloud: () => Promise<void>;
   addTrackToCloudPlaylist: (playlistId: string, track: Track) => Promise<void>;
   removeTrackFromActivePlaylist: (trackId: string | number) => Promise<void>;
+  toggleFavorite: (track: Track) => Promise<void>;
 
-  // Playback
-  playTrackList: (tracks: Track[], index: number, meta?: { kind?: 'cloud' | 'netease'; playlistId?: string | null; sourceId?: string | null }) => Promise<void>;
+  // Playback & Queue
+  playTrackList: (
+    tracks: Track[],
+    index: number,
+    meta?: { kind?: 'cloud' | 'netease'; playlistId?: string | null; sourceId?: string | null },
+  ) => Promise<void>;
   playQueueIndex: (index: number) => Promise<void>;
   reshuffleQueue: () => void;
   playTrackNow: (track: Track) => Promise<void>;
   playNextInQueue: (track: Track) => void;
+  removeFromQueue: (index: number) => void;
+  clearQueue: () => void;
+  switchSourceForTrack: (track: Track) => void;
   togglePlay: () => Promise<void>;
   playPrev: () => Promise<void>;
   playNext: (autoAdvance?: boolean) => Promise<void>;
@@ -200,23 +306,258 @@ export interface PlayerStoreState {
   setSearchSource: (src: MusicSource) => void;
   setSearchQuery: (q: string) => void;
   executeSearch: (query?: string, source?: MusicSource) => Promise<void>;
+  removeSearchHistory: (term: string) => void;
+  clearAllSearchHistory: () => void;
 }
 
 const MODE_ORDER: PlayMode[] = ['sequence', 'random', 'single'];
 
-function extractNeteasePlaylistId(raw: string): string | null {
-  const trimmed = raw.trim();
-  if (/^\d{4,}$/.test(trimmed)) return trimmed;
-  const m = trimmed.match(/[?&]id=(\d+)/) || trimmed.match(/playlist\/(\d+)/);
-  return m ? m[1] : null;
-}
-
 export const usePlayerStore = create<PlayerStoreState>((set, get) => {
+  const clearWebSleepTimers = () => {
+    if (sleepTimeoutId) {
+      clearTimeout(sleepTimeoutId);
+      sleepTimeoutId = null;
+    }
+    if (sleepFadeIntervalId) {
+      clearInterval(sleepFadeIntervalId);
+      sleepFadeIntervalId = null;
+    }
+  };
+
+  const cancelScheduledPreload = () => {
+    if (preloadTimerId) {
+      clearTimeout(preloadTimerId);
+      preloadTimerId = null;
+    }
+  };
+
+  const syncFavoriteSnapshot = (playlists: PlaylistSummary[] = cpSync.mirror.playlists) => {
+    const favSummary = playlists.find((p) => p.name.trim() === FAVORITE_PLAYLIST_NAME);
+    if (!favSummary) {
+      set({ favoritePlaylistId: null, favoriteTrackIds: [] });
+      return null;
+    }
+    const detail = cpSync.mirror.detail[favSummary.id];
+    set({
+      favoritePlaylistId: favSummary.id,
+      favoriteTrackIds: detail ? detail.tracks.map((t) => String(t.id)) : get().favoriteTrackIds,
+    });
+    return favSummary.id;
+  };
+
+  const preloadFavoritesDetailIfNeeded = async () => {
+    const favId = syncFavoriteSnapshot();
+    if (favId && !cpSync.mirror.detail[favId] && cpSync.isLoggedIn()) {
+      try {
+        await cpSync.getPlaylist(favId, false);
+        syncFavoriteSnapshot();
+      } catch {
+        // Ignore silent background fetch failure
+      }
+    }
+  };
+
+  const effectiveQualityForStore = (): Exclude<QualityLevel, 'auto'> => {
+    const st = get();
+    const metered = audioEngine ? audioEngine.isMeteredNetwork() : st.isMeteredNetwork;
+    if (metered !== st.isMeteredNetwork) {
+      set({ isMeteredNetwork: metered });
+    }
+    return resolveEffectiveQuality(st.quality, metered, st.mobileQualityLimit);
+  };
+
+  const syncRepeatMode = () => {
+    const st = get();
+    audioEngine?.setRepeatOne(st.playMode === 'single' && st.sleepTimerMode !== 'track');
+  };
+
+  const runNextPreload = async () => {
+    const st = get();
+    if (
+      !st.preloadNextEnabled ||
+      st.playMode === 'single' ||
+      st.sleepTimerMode === 'track' ||
+      st.queue.length <= 1 ||
+      st.currentIndex < 0
+    ) {
+      audioEngine?.clearNextPreloadedTrack();
+      return;
+    }
+
+    const { nextIndex } = getAdjacentIndices(st.queue.length, st.currentIndex);
+    if (nextIndex < 0 || nextIndex === st.currentIndex) return;
+    const nextTrack = st.queue[nextIndex];
+    if (!nextTrack) return;
+
+    const reqSeqSnapshot = songRequestSeq;
+    const effectiveQ = effectiveQualityForStore();
+    const src = songSourceOf(nextTrack.id);
+    const cacheTag = src === 'wy' ? effectiveQ : src;
+
+    try {
+      const data = await preloadCache.getOrFetch(nextTrack.id, cacheTag, () =>
+        musicService.getSong(nextTrack.id, effectiveQ),
+      );
+      const latest = get();
+      if (songRequestSeq !== reqSeqSnapshot) return;
+      if (
+        !latest.preloadNextEnabled ||
+        latest.playMode === 'single' ||
+        latest.sleepTimerMode === 'track'
+      ) {
+        return;
+      }
+      const latestAdj = getAdjacentIndices(latest.queue.length, latest.currentIndex);
+      const latestNext = latest.queue[latestAdj.nextIndex];
+      if (!latestNext || String(latestNext.id) !== String(nextTrack.id)) return;
+
+      const exoKey = buildAudioCacheKey(data.id, data.requestedLevel || src);
+      audioEngine?.setNextPreloadedTrack(data, exoKey);
+    } catch {
+      // Preload errors are silent; fallback happens only if playback actually reaches the track
+    }
+  };
+
+  const scheduleNextPreload = (delayMs = 1200) => {
+    cancelScheduledPreload();
+    const st = get();
+    if (
+      !st.preloadNextEnabled ||
+      st.playMode === 'single' ||
+      st.sleepTimerMode === 'track' ||
+      st.queue.length <= 1 ||
+      st.currentIndex < 0
+    ) {
+      audioEngine?.clearNextPreloadedTrack();
+      return;
+    }
+    preloadTimerId = setTimeout(() => {
+      preloadTimerId = null;
+      void runNextPreload();
+    }, delayMs);
+  };
+
+  const persistPlaybackProgress = (track: Track) => {
+    const st = get();
+    if (st.activeCloudPlaylistId) {
+      cpSync.setPlaybackState({
+        kind: 'cloud',
+        playlistId: st.activeCloudPlaylistId,
+        trackIndex: st.currentIndex,
+        trackId: String(track.id),
+        updatedAt: Date.now(),
+      });
+    } else if (st.activeNeteasePlaylistId) {
+      cpSync.setPlaybackState({
+        kind: 'netease',
+        sourceId: st.activeNeteasePlaylistId,
+        trackIndex: st.currentIndex,
+        trackId: String(track.id),
+        updatedAt: Date.now(),
+      });
+    }
+  };
+
+  const loadLyricsFor = async (id: string | number, seq: number) => {
+    const cached = await getCachedLyric(id);
+    if (cached && seq === songRequestSeq) {
+      set({ lyrics: parseLyrics(cached) });
+    }
+    const fetched = await musicService.getLyric(id);
+    if (fetched && seq === songRequestSeq) {
+      set({ lyrics: parseLyrics(fetched) });
+      void setCachedLyric(id, fetched);
+    }
+  };
+
+  const handleNativeTrackTransition = (mediaId: string) => {
+    const st = get();
+    if (!st.queue.length) return;
+    const { nextIndex } = getAdjacentIndices(st.queue.length, st.currentIndex);
+    let resolvedIndex = -1;
+    if (
+      nextIndex >= 0 &&
+      st.queue[nextIndex] &&
+      String(st.queue[nextIndex].id) === String(mediaId)
+    ) {
+      resolvedIndex = nextIndex;
+    } else if (mediaId) {
+      resolvedIndex = st.queue.findIndex((t) => String(t.id) === String(mediaId));
+    }
+    if (resolvedIndex < 0) return;
+
+    const track = st.queue[resolvedIndex];
+    const seq = ++songRequestSeq;
+    lastPreloadRefreshSeq = -1;
+    consecutiveAutoSkipErrors = 0;
+    activeSongAbort?.abort();
+    activeSongAbort = null;
+    if (autoSkipTimerId) {
+      clearTimeout(autoSkipTimerId);
+      autoSkipTimerId = null;
+    }
+
+    const effectiveQ = effectiveQualityForStore();
+    const src = songSourceOf(track.id);
+    const cacheTag = src === 'wy' ? effectiveQ : src;
+    const preloaded = preloadCache.getValid(track.id, cacheTag);
+
+    const songData: SongPlaybackData = preloaded || {
+      id: track.id,
+      url: '',
+      name: track.name,
+      artist: track.artist,
+      album: track.album,
+      cover: track.cover,
+      source: track.source || src.toUpperCase(),
+      requestedLevel: src === 'wy' ? effectiveQ : null,
+      level: src === 'wy' ? effectiveQ : null,
+      br: null,
+    };
+
+    const mergedTrack: Track = {
+      ...track,
+      name: songData.name || track.name,
+      artist: songData.artist || track.artist,
+      cover: songData.cover || track.cover,
+    };
+
+    audioEngine?.syncTransitionedTrack(songData);
+
+    set({
+      currentIndex: resolvedIndex,
+      currentTrack: mergedTrack,
+      currentSongData: songData,
+      isPlaying: true,
+      isBuffering: false,
+      currentTime: 0,
+      duration: 0,
+      lyrics: [],
+      actualQualityText: computeQualityBadge(songData),
+      failedTrackOffer: null,
+    });
+
+    void extractFluidPalette(mergedTrack.cover, `${mergedTrack.id}-${mergedTrack.name}`).then(
+      (palette) => {
+        if (songRequestSeq === seq) set({ fluidPalette: palette });
+      },
+    );
+
+    persistPlaybackProgress(mergedTrack);
+    void loadLyricsFor(mergedTrack.id, seq);
+    scheduleNextPreload(400);
+  };
+
   const ensureAudioEngine = (): AudioEngine => {
     if (audioEngine) return audioEngine;
     audioEngine = new AudioEngine({
       onTimeUpdate: (currentTime, duration) => {
-        set({ currentTime, duration: duration || get().duration });
+        const dur = duration || get().duration;
+        set({ currentTime, duration: dur });
+        if (dur > 35 && dur - currentTime <= 28 && lastPreloadRefreshSeq !== songRequestSeq) {
+          lastPreloadRefreshSeq = songRequestSeq;
+          void runNextPreload();
+        }
       },
       onPlayStateChange: (isPlaying) => set({ isPlaying }),
       onBufferingChange: (isBuffering) => set({ isBuffering }),
@@ -225,6 +566,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         if (st.sleepTimerMode === 'track') {
           set({ sleepTimerMode: 'off', sleepTimerEndsAt: null, isPlaying: false });
           audioEngine?.pause();
+          syncRepeatMode();
           st.showToast('本首播完，睡眠定时已暂停播放');
           return;
         }
@@ -236,7 +578,9 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         }
       },
       onError: (msg) => {
-        get().showToast(msg);
+        const st = get();
+        if (st.currentTrack) set({ failedTrackOffer: st.currentTrack });
+        st.showToast(msg);
       },
       onPrev: () => {
         void get().playPrev();
@@ -245,14 +589,39 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         void get().playNext(false);
       },
       resolveExpiredSong: async (id) => {
-        return musicService.getSong(id, get().quality);
+        preloadCache.invalidate(id);
+        return musicService.getSong(id, effectiveQualityForStore());
+      },
+      onNativeTrackTransition: (mediaId) => {
+        handleNativeTrackTransition(mediaId);
+      },
+      onNativeSleepTimerFired: (mode) => {
+        clearWebSleepTimers();
+        set({ sleepTimerMode: 'off', sleepTimerEndsAt: null, isPlaying: false });
+        syncRepeatMode();
+        get().showToast(
+          mode === 'track' ? '本首播完，睡眠定时已暂停播放' : '睡眠定时已到达，已暂停播放',
+        );
       },
     });
     return audioEngine;
   };
 
-  const loadSongAt = async (track: Track, startTime = 0) => {
+  const loadSongAt = async (
+    track: Track,
+    startTime = 0,
+    opts: { autoAdvance?: boolean } = {},
+  ) => {
     const seq = ++songRequestSeq;
+    lastPreloadRefreshSeq = -1;
+    if (!opts.autoAdvance) {
+      consecutiveAutoSkipErrors = 0;
+    }
+    if (autoSkipTimerId) {
+      clearTimeout(autoSkipTimerId);
+      autoSkipTimerId = null;
+    }
+    cancelScheduledPreload();
     activeSongAbort?.abort();
     const controller = new AbortController();
     activeSongAbort = controller;
@@ -264,6 +633,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       duration: 0,
       lyrics: [],
       actualQualityText: null,
+      failedTrackOffer: null,
     });
 
     // Update fluid backdrop immediately (smooth lerp)
@@ -280,7 +650,12 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     });
 
     try {
-      const songData = await musicService.getSong(track.id, get().quality, controller.signal);
+      const effectiveQ = effectiveQualityForStore();
+      const src = songSourceOf(track.id);
+      const cacheTag = src === 'wy' ? effectiveQ : src;
+      const songData = await preloadCache.getOrFetch(track.id, cacheTag, () =>
+        musicService.getSong(track.id, effectiveQ, controller.signal),
+      );
       if (seq !== songRequestSeq) return;
 
       const mergedTrack: Track = {
@@ -290,79 +665,64 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         cover: songData.cover || track.cover,
       };
 
-      const qualityBadge =
-        songData.qualityText ||
-        (songData.level
-          ? ({
-              standard: '标准 128K',
-              higher: '较高 192K',
-              exhigh: '极高 320K',
-              lossless: '无损 FLAC',
-              hires: 'Hi-Res',
-              jyeffect: '高清臻音',
-              sky: '沉浸环绕声',
-              jymaster: '超清母带',
-            }[songData.level] ?? songData.level)
-          : null);
-
       set({
         currentTrack: mergedTrack,
         currentSongData: songData,
-        actualQualityText: qualityBadge,
+        actualQualityText: computeQualityBadge(songData),
       });
 
       if (songData.cover && songData.cover !== track.cover) {
-        void extractFluidPalette(songData.cover, `${mergedTrack.id}-${mergedTrack.name}`).then((palette) => {
-          if (songRequestSeq === seq) set({ fluidPalette: palette });
-        });
+        void extractFluidPalette(songData.cover, `${mergedTrack.id}-${mergedTrack.name}`).then(
+          (palette) => {
+            if (songRequestSeq === seq) set({ fluidPalette: palette });
+          },
+        );
       }
 
-      // Start audio playback FIRST (highest priority)
-      await engine.loadAndPlay(songData, startTime);
+      const exoKey = buildAudioCacheKey(songData.id, songData.requestedLevel || src);
+      syncRepeatMode();
+      await engine.loadAndPlay(songData, startTime, exoKey);
+      if (seq !== songRequestSeq) return;
 
-      // Persist playback state to CPSync
-      const st = get();
-      if (st.activeCloudPlaylistId) {
-        cpSync.setPlaybackState({
-          kind: 'cloud',
-          playlistId: st.activeCloudPlaylistId,
-          trackIndex: st.currentIndex,
-          trackId: String(mergedTrack.id),
-          updatedAt: Date.now(),
-        });
-      } else if (st.activeNeteasePlaylistId) {
-        cpSync.setPlaybackState({
-          kind: 'netease',
-          sourceId: st.activeNeteasePlaylistId,
-          trackIndex: st.currentIndex,
-          trackId: String(mergedTrack.id),
-          updatedAt: Date.now(),
-        });
-      }
-
-      // Fetch lyrics asynchronously after playback starts
+      consecutiveAutoSkipErrors = 0;
+      persistPlaybackProgress(mergedTrack);
       void loadLyricsFor(mergedTrack.id, seq);
+      scheduleNextPreload(1200);
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       if (seq !== songRequestSeq) return;
-      set({ isBuffering: false, isPlaying: false });
-      const msg = err instanceof Error ? err.message : '播放失败';
-      get().showToast(msg);
-      if (msg.includes('登录')) {
-        get().openSheet('account');
-      }
-    }
-  };
 
-  const loadLyricsFor = async (id: string | number, seq: number) => {
-    const cached = await getCachedLyric(id);
-    if (cached && seq === songRequestSeq) {
-      set({ lyrics: parseLyrics(cached) });
-    }
-    const fetched = await musicService.getLyric(id);
-    if (fetched && seq === songRequestSeq) {
-      set({ lyrics: parseLyrics(fetched) });
-      void setCachedLyric(id, fetched);
+      const msg = err instanceof Error ? err.message : '播放失败';
+      if (msg.includes('登录')) {
+        consecutiveAutoSkipErrors = 0;
+        set({ isBuffering: false, isPlaying: false });
+        get().showToast(msg);
+        get().openSheet('account');
+        return;
+      }
+
+      const st = get();
+      if (
+        opts.autoAdvance &&
+        st.autoSkipFailed &&
+        st.queue.length > 1 &&
+        consecutiveAutoSkipErrors < 3
+      ) {
+        consecutiveAutoSkipErrors += 1;
+        set({ isBuffering: false, isPlaying: false });
+        get().showToast(`「${track.name}」暂不可播，自动跳过`);
+        autoSkipTimerId = setTimeout(() => {
+          autoSkipTimerId = null;
+          if (songRequestSeq === seq) {
+            void get().playNext(true);
+          }
+        }, 350);
+        return;
+      }
+
+      consecutiveAutoSkipErrors = 0;
+      set({ isBuffering: false, isPlaying: false, failedTrackOffer: track });
+      get().showToast(msg);
     }
   };
 
@@ -384,6 +744,8 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     activeCloudPlaylistId: null,
     activeNeteasePlaylistId: null,
     loadingPlaylist: false,
+    favoritePlaylistId: null,
+    favoriteTrackIds: [],
 
     queue: [],
     originalQueue: [],
@@ -394,29 +756,40 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     isBuffering: false,
     currentTime: 0,
     duration: 0,
-    playMode: (localStorage.getItem('cp_play_mode') as PlayMode) || 'sequence',
+    playMode: (safeStorageGet('cp_play_mode') as PlayMode) || 'sequence',
     quality: musicService.quality,
     actualQualityText: null,
     lyrics: [],
     fluidPalette: DEFAULT_FLUID_PALETTE,
+    isMeteredNetwork: false,
+    failedTrackOffer: null,
 
     showVerbatim: readBoolPref('showVerbatim', true),
     showTranslation: readBoolPref('showTranslation', true),
     showRomaji: readBoolPref('showRomaji', true),
     fluidMotion: readBoolPref('fluidMotion', true),
+    fluidPowerSave: readBoolPref('fluidPowerSave', true),
+    mobileQualityLimit: readBoolPref('mobileQualityLimit', true),
+    preloadNextEnabled: readBoolPref('preloadNextEnabled', true),
+    autoSkipFailed: readBoolPref('autoSkipFailed', true),
+    lyricFontSize: readLyricFontSize(),
     sleepTimerMode: 'off',
     sleepTimerEndsAt: null,
 
-    searchSource: (localStorage.getItem('cp_search_source') as MusicSource) || 'wy',
+    searchSource: (safeStorageGet('cp_search_source') as MusicSource) || 'wy',
     searchQuery: '',
     searchResults: [],
     searching: false,
     searchError: null,
+    searchHistory: loadSearchHistory(),
 
     init: async () => {
       if (initialized) return;
       initialized = true;
-      ensureAudioEngine();
+      const engine = ensureAudioEngine();
+      set({ isMeteredNetwork: engine.isMeteredNetwork() });
+      syncRepeatMode();
+      syncFavoriteSnapshot();
 
       cpSync.addEventListener('status', (e) => {
         const detail = (e as CustomEvent<{ status: SyncStatusType }>).detail;
@@ -424,21 +797,26 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       });
       cpSync.addEventListener('mirror', () => {
         set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+        syncFavoriteSnapshot();
       });
       cpSync.addEventListener('auth', (e) => {
         const detail = (e as CustomEvent<{ user: AuthUser | null }>).detail;
         playerAuth.invalidate();
+        preloadCache.invalidate();
         set({ user: detail.user });
       });
 
-      document.addEventListener('cplayer:login-required', () => {
-        get().openSheet('account');
-      });
+      if (typeof document !== 'undefined') {
+        document.addEventListener('cplayer:login-required', () => {
+          get().openSheet('account');
+        });
+      }
 
-      // Restore session if token exists
       const restored = await cpSync.restoreSession();
       if (restored) {
         set({ user: restored, cloudPlaylists: [...cpSync.mirror.playlists] });
+        void preloadFavoritesDetailIfNeeded();
+
         const pb = cpSync.mirror.playbackState;
         if (pb?.kind === 'cloud' && pb.playlistId) {
           await get().selectCloudPlaylist(pb.playlistId, false);
@@ -459,8 +837,8 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
               currentTrack: restoredOrder.queue[restoredOrder.currentIndex],
             });
             const cur = restoredOrder.queue[restoredOrder.currentIndex];
-            void extractFluidPalette(cur.cover, `${cur.id}-${cur.name}`).then(
-              (palette) => set({ fluidPalette: palette }),
+            void extractFluidPalette(cur.cover, `${cur.id}-${cur.name}`).then((palette) =>
+              set({ fluidPalette: palette }),
             );
           }
         } else if (cpSync.mirror.playlists.length > 0) {
@@ -471,7 +849,12 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
 
     setActiveTab: (activeTab) => set({ activeTab: Math.max(0, Math.min(2, activeTab)) }),
     setShowLyrics: (showLyrics) => set({ showLyrics }),
-    openSheet: (activeSheet, track = null) => set({ activeSheet, sheetTrackTarget: track }),
+    openSheet: (activeSheet, track = null) => {
+      if (activeSheet === 'settings' || activeSheet === 'quality') {
+        get().refreshNetworkStatus();
+      }
+      set({ activeSheet, sheetTrackTarget: track });
+    },
     closeSheet: () => set({ activeSheet: null, sheetTrackTarget: null }),
 
     showToast: (msg) => {
@@ -480,10 +863,14 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       toastTimer = setTimeout(() => set({ toastMessage: null }), 2200);
     },
 
+    dismissFailedOffer: () => set({ failedTrackOffer: null }),
+
     login: async (username, password) => {
       const data = await cpSync.login(username.trim(), password);
       playerAuth.invalidate();
+      preloadCache.invalidate();
       set({ user: data.user, cloudPlaylists: [...cpSync.mirror.playlists] });
+      void preloadFavoritesDetailIfNeeded();
       get().showToast(`欢迎回来，${data.user.username}`);
       if (cpSync.mirror.playlists.length > 0) {
         await get().selectCloudPlaylist(cpSync.mirror.playlists[0].id, false);
@@ -494,7 +881,9 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     register: async (username, password, inviteCode) => {
       const data = await cpSync.register(username.trim(), password, inviteCode?.trim());
       playerAuth.invalidate();
+      preloadCache.invalidate();
       set({ user: data.user, cloudPlaylists: [...cpSync.mirror.playlists] });
+      syncFavoriteSnapshot();
       get().showToast(`注册成功，${data.user.username}`);
       get().closeSheet();
     },
@@ -502,9 +891,12 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     logout: async () => {
       await cpSync.logout();
       playerAuth.invalidate();
+      preloadCache.invalidate();
       set({
         user: null,
         cloudPlaylists: [...cpSync.mirror.playlists],
+        favoritePlaylistId: null,
+        favoriteTrackIds: [],
       });
       get().showToast('已退出登录');
     },
@@ -513,6 +905,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       try {
         await cpSync.refreshAll();
         set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+        void preloadFavoritesDetailIfNeeded();
         const curCloudId = get().activeCloudPlaylistId;
         if (curCloudId) {
           await get().selectCloudPlaylist(curCloudId, true);
@@ -527,44 +920,119 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       musicService.setBaseUrl(apiBase);
       cpSync.setBaseUrl(syncApi);
       playerAuth.setSyncBase(cpSync.baseUrl);
+      preloadCache.invalidate();
       get().showToast('接口地址已更新');
     },
 
     setPreference: (key, value) => {
-      try {
-        localStorage.setItem(PREF_STORAGE_KEYS[key], value ? '1' : '0');
-      } catch {
-        // Ignore storage error
-      }
+      safeStorageSet(PREF_STORAGE_KEYS[key], value ? '1' : '0');
       set({ [key]: value } as Partial<PlayerStoreState>);
+      if (key === 'mobileQualityLimit') {
+        get().refreshNetworkStatus();
+        scheduleNextPreload(150);
+      } else if (key === 'preloadNextEnabled') {
+        if (value) scheduleNextPreload(150);
+        else {
+          cancelScheduledPreload();
+          audioEngine?.clearNextPreloadedTrack();
+        }
+      }
+    },
+
+    setLyricFontSize: (lyricFontSize) => {
+      safeStorageSet(LYRIC_SIZE_KEY, lyricFontSize);
+      set({ lyricFontSize });
     },
 
     setSleepTimer: (mode) => {
-      if (sleepTimeoutId) {
-        clearTimeout(sleepTimeoutId);
-        sleepTimeoutId = null;
-      }
+      clearWebSleepTimers();
+      const engine = ensureAudioEngine();
+      engine.setVolume(1);
+
       if (mode === 'off') {
+        engine.setNativeSleepTimer('off', 0);
         set({ sleepTimerMode: 'off', sleepTimerEndsAt: null });
+        syncRepeatMode();
+        scheduleNextPreload(200);
         get().showToast('已关闭睡眠定时');
         return;
       }
+
       if (mode === 'track') {
+        engine.setNativeSleepTimer('track', 0);
+        engine.clearNextPreloadedTrack();
+        cancelScheduledPreload();
         set({ sleepTimerMode: 'track', sleepTimerEndsAt: null });
+        syncRepeatMode();
         get().showToast('播完当前歌曲后将自动暂停');
         return;
       }
+
       const minutes = parseInt(mode, 10);
       const ms = minutes * 60_000;
       const endsAt = Date.now() + ms;
+      const handledNative = engine.setNativeSleepTimer('timed', ms);
       set({ sleepTimerMode: mode, sleepTimerEndsAt: endsAt });
-      sleepTimeoutId = setTimeout(() => {
-        sleepTimeoutId = null;
-        audioEngine?.pause();
-        set({ sleepTimerMode: 'off', sleepTimerEndsAt: null, isPlaying: false });
-        get().showToast('睡眠定时已到达，已暂停播放');
-      }, ms);
+      syncRepeatMode();
+      scheduleNextPreload(200);
+
+      if (!handledNative) {
+        const fadeStartDelay = Math.max(0, ms - 3000);
+        sleepTimeoutId = setTimeout(() => {
+          sleepTimeoutId = null;
+          let step = 0;
+          const totalSteps = 15;
+          sleepFadeIntervalId = setInterval(() => {
+            step += 1;
+            if (step >= totalSteps) {
+              if (sleepFadeIntervalId) {
+                clearInterval(sleepFadeIntervalId);
+                sleepFadeIntervalId = null;
+              }
+              engine.pause();
+              engine.setVolume(1);
+              set({ sleepTimerMode: 'off', sleepTimerEndsAt: null, isPlaying: false });
+              get().showToast('睡眠定时已到达，已暂停播放');
+              return;
+            }
+            engine.setVolume((totalSteps - step) / totalSteps);
+          }, 200);
+        }, fadeStartDelay);
+      }
+
       get().showToast(`已开启 ${minutes} 分钟睡眠定时`);
+    },
+
+    refreshNetworkStatus: () => {
+      const metered = audioEngine ? audioEngine.isMeteredNetwork() : false;
+      set({ isMeteredNetwork: metered });
+      return metered;
+    },
+
+    getCacheSummary: async () => {
+      const audioBytes = audioEngine ? audioEngine.getAudioCacheBytes() : 0;
+      const dbStats = await getDbCacheStats();
+      return {
+        audioBytes,
+        playlistCount: dbStats.playlistCount,
+        lyricCount: dbStats.lyricCount,
+      };
+    },
+
+    clearAudioCache: () => {
+      const ok = audioEngine ? audioEngine.clearAudioCache() : false;
+      preloadCache.invalidate();
+      get().showToast(ok ? '已清理音频边听边存缓存' : '当前环境无本地音频缓存');
+      return ok;
+    },
+
+    clearMetadataCache: async () => {
+      await clearDbCaches();
+      get().showToast('已清理歌单与歌词本地缓存');
+    },
+
+    openExternalLink: (url) => {
+      return ensureAudioEngine().openExternalUrl(url);
     },
 
     selectCloudPlaylist: async (id, force = false) => {
@@ -572,6 +1040,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       try {
         const detail: PlaylistDetail = await cpSync.getPlaylist(id, force);
         const tracks = CPSync.toPlayerTracks(detail.tracks);
+        syncFavoriteSnapshot();
         set({
           activePlaylistKey: `cloud:${detail.id}`,
           activePlaylistName: detail.name,
@@ -643,6 +1112,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       try {
         const created = await cpSync.createPlaylist({ name: trimmed, tracks: [] });
         set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+        syncFavoriteSnapshot();
         await get().selectCloudPlaylist(created.id);
         get().closeSheet();
         get().showToast(`已创建歌单「${created.name}」`);
@@ -651,11 +1121,33 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       }
     },
 
+    renameCloudPlaylist: async (id, name) => {
+      const trimmed = name.trim();
+      if (!trimmed) {
+        get().showToast('歌单名称不能为空');
+        return;
+      }
+      try {
+        const detail = await cpSync.getPlaylist(id);
+        const updated = await cpSync.updatePlaylist(id, { name: trimmed }, detail.version);
+        set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+        if (get().activeCloudPlaylistId === id) {
+          set({ activePlaylistName: updated.name });
+        }
+        syncFavoriteSnapshot();
+        get().closeSheet();
+        get().showToast(`已重命名为「${updated.name}」`);
+      } catch (err) {
+        get().showToast(err instanceof Error ? err.message : '重命名失败');
+      }
+    },
+
     deleteCloudPlaylist: async (id) => {
       try {
         await cpSync.deletePlaylist(id);
         const remaining = [...cpSync.mirror.playlists];
         set({ cloudPlaylists: remaining });
+        syncFavoriteSnapshot();
         if (get().activeCloudPlaylistId === id) {
           if (remaining.length > 0) {
             await get().selectCloudPlaylist(remaining[0].id);
@@ -668,9 +1160,37 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
             });
           }
         }
+        if (get().activeSheet === 'playlistManage') get().closeSheet();
         get().showToast('已删除歌单');
       } catch (err) {
         get().showToast(err instanceof Error ? err.message : '删除失败');
+      }
+    },
+
+    saveNeteasePlaylistToCloud: async () => {
+      const st = get();
+      if (!cpSync.isLoggedIn()) {
+        st.showToast('请先登录 CPlayerSync 再保存到云歌单');
+        st.openSheet('account');
+        return;
+      }
+      if (!st.activePlaylistTracks.length) {
+        st.showToast('当前歌单为空');
+        return;
+      }
+      try {
+        const created = await cpSync.createPlaylist({
+          name: st.activePlaylistName || '导入的网易云歌单',
+          source: 'netease',
+          sourceId: st.activeNeteasePlaylistId,
+          tracks: st.activePlaylistTracks,
+        });
+        set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+        syncFavoriteSnapshot();
+        await get().selectCloudPlaylist(created.id);
+        get().showToast(`已保存至云歌单「${created.name}」`);
+      } catch (err) {
+        get().showToast(err instanceof Error ? err.message : '保存云歌单失败');
       }
     },
 
@@ -678,6 +1198,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       try {
         const res = await cpSync.addTracks(playlistId, [track]);
         set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+        syncFavoriteSnapshot();
         if (get().activeCloudPlaylistId === playlistId && res.playlist) {
           set({ activePlaylistTracks: CPSync.toPlayerTracks(res.playlist.tracks) });
         }
@@ -696,6 +1217,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
             cloudPlaylists: [...cpSync.mirror.playlists],
             activePlaylistTracks: res.playlist ? CPSync.toPlayerTracks(res.playlist.tracks) : [],
           });
+          syncFavoriteSnapshot();
           get().showToast('已从歌单移除');
         } catch (err) {
           get().showToast(err instanceof Error ? err.message : '移除失败');
@@ -704,6 +1226,49 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         const filtered = get().activePlaylistTracks.filter((t) => String(t.id) !== String(trackId));
         set({ activePlaylistTracks: filtered });
         get().showToast('已从列表移除');
+      }
+    },
+
+    toggleFavorite: async (track) => {
+      if (!cpSync.isLoggedIn()) {
+        get().showToast('请先登录 CPlayerSync 以收藏歌曲');
+        get().openSheet('account');
+        return;
+      }
+      try {
+        let favId = get().favoritePlaylistId || syncFavoriteSnapshot();
+        if (!favId) {
+          await cpSync.createPlaylist({
+            name: FAVORITE_PLAYLIST_NAME,
+            tracks: [track],
+          });
+          set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+          syncFavoriteSnapshot();
+          get().showToast('已添加到我喜欢的音乐');
+          return;
+        }
+
+        const detail = await cpSync.getPlaylist(favId);
+        const exists = detail.tracks.some((t) => String(t.id) === String(track.id));
+        if (exists) {
+          const res = await cpSync.removeTrack(favId, track.id);
+          set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+          syncFavoriteSnapshot();
+          if (get().activeCloudPlaylistId === favId && res.playlist) {
+            set({ activePlaylistTracks: CPSync.toPlayerTracks(res.playlist.tracks) });
+          }
+          get().showToast('已取消喜欢');
+        } else {
+          const res = await cpSync.addTracks(favId, [track]);
+          set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+          syncFavoriteSnapshot();
+          if (get().activeCloudPlaylistId === favId && res.playlist) {
+            set({ activePlaylistTracks: CPSync.toPlayerTracks(res.playlist.tracks) });
+          }
+          get().showToast('已添加到我喜欢的音乐');
+        }
+      } catch (err) {
+        get().showToast(err instanceof Error ? err.message : '收藏操作失败');
       }
     },
 
@@ -746,6 +1311,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         queue: shuffled.queue,
         currentIndex: shuffled.currentIndex,
       });
+      scheduleNextPreload(200);
       get().showToast('已重新随机打乱播放列表');
     },
 
@@ -779,12 +1345,98 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         (t) => get().currentTrack && String(t.id) === String(get().currentTrack?.id),
       );
       const insertAt = nextCurIdx >= 0 ? nextCurIdx + 1 : q.length;
-      q.splice(insertAt, 0, track);
+      if (existing !== nextCurIdx) {
+        q.splice(insertAt, 0, track);
+      }
       if (!orig.some((t) => String(t.id) === String(track.id))) {
         orig.push(track);
       }
       set({ queue: q, originalQueue: orig, currentIndex: nextCurIdx >= 0 ? nextCurIdx : curIdx });
+      scheduleNextPreload(200);
       get().showToast(`已添加到下一首播放 · ${track.name}`);
+    },
+
+    removeFromQueue: (index) => {
+      const st = get();
+      if (index < 0 || index >= st.queue.length) return;
+      if (st.queue.length === 1) {
+        st.clearQueue();
+        return;
+      }
+
+      const removed = st.queue[index];
+      const nextQueue = st.queue.filter((_, i) => i !== index);
+      const nextOrig = st.originalQueue.filter((t) => String(t.id) !== String(removed.id));
+
+      if (index < st.currentIndex) {
+        set({
+          queue: nextQueue,
+          originalQueue: nextOrig,
+          currentIndex: st.currentIndex - 1,
+        });
+        scheduleNextPreload(200);
+        return;
+      }
+
+      if (index === st.currentIndex) {
+        const nextIdx = Math.min(index, nextQueue.length - 1);
+        set({
+          queue: nextQueue,
+          originalQueue: nextOrig,
+          currentIndex: nextIdx,
+        });
+        void loadSongAt(nextQueue[nextIdx], 0);
+        return;
+      }
+
+      set({ queue: nextQueue, originalQueue: nextOrig });
+      scheduleNextPreload(200);
+    },
+
+    clearQueue: () => {
+      ++songRequestSeq;
+      lastPreloadRefreshSeq = -1;
+      consecutiveAutoSkipErrors = 0;
+      if (autoSkipTimerId) {
+        clearTimeout(autoSkipTimerId);
+        autoSkipTimerId = null;
+      }
+      cancelScheduledPreload();
+      activeSongAbort?.abort();
+      activeSongAbort = null;
+      audioEngine?.clearNextPreloadedTrack();
+      audioEngine?.stop();
+      set({
+        queue: [],
+        originalQueue: [],
+        currentIndex: -1,
+        currentTrack: null,
+        currentSongData: null,
+        isPlaying: false,
+        isBuffering: false,
+        currentTime: 0,
+        duration: 0,
+        lyrics: [],
+        actualQualityText: null,
+        failedTrackOffer: null,
+      });
+      get().showToast('已清空播放队列');
+    },
+
+    switchSourceForTrack: (track) => {
+      const src = songSourceOf(track.id);
+      const altSource: MusicSource = src === 'wy' ? 'qq' : 'wy';
+      const query = `${track.name} ${track.artist || ''}`.trim();
+      safeStorageSet('cp_search_source', altSource);
+      set({
+        failedTrackOffer: null,
+        activeSheet: null,
+        sheetTrackTarget: null,
+        activeTab: 2,
+        searchSource: altSource,
+        searchQuery: query,
+      });
+      void get().executeSearch(query, altSource);
     },
 
     togglePlay: async () => {
@@ -798,7 +1450,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         }
         return;
       }
-      if (!st.currentSongData) {
+      if (!st.currentSongData || !st.currentSongData.url) {
         await loadSongAt(st.currentTrack, st.currentTime);
         return;
       }
@@ -822,13 +1474,13 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       await loadSongAt(queue[prevIndex], 0);
     },
 
-    playNext: async () => {
+    playNext: async (autoAdvance = false) => {
       const { queue, currentIndex } = get();
       if (!queue.length) return;
       const { nextIndex } = getAdjacentIndices(queue.length, currentIndex);
       if (nextIndex < 0) return;
       set({ currentIndex: nextIndex });
-      await loadSongAt(queue[nextIndex], 0);
+      await loadSongAt(queue[nextIndex], 0, { autoAdvance });
     },
 
     seekTo: (time) => {
@@ -838,7 +1490,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     cyclePlayMode: () => {
       const { playMode: cur, queue, originalQueue, currentIndex, currentTrack } = get();
       const next = MODE_ORDER[(MODE_ORDER.indexOf(cur) + 1) % MODE_ORDER.length];
-      localStorage.setItem('cp_play_mode', next);
+      safeStorageSet('cp_play_mode', next);
 
       if (next === 'random') {
         const snapshot = originalQueue.length ? originalQueue : [...queue];
@@ -849,6 +1501,8 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
           queue: shuffled.queue,
           currentIndex: shuffled.currentIndex,
         });
+        syncRepeatMode();
+        scheduleNextPreload(200);
         get().showToast(
           queue.length > 1
             ? '随机播放 · 已打乱播放列表顺序'
@@ -864,6 +1518,8 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
           queue: restored.queue,
           currentIndex: restored.currentIndex,
         });
+        syncRepeatMode();
+        scheduleNextPreload(200);
         get().showToast(
           next === 'single'
             ? '单曲循环 · 已恢复原歌单顺序'
@@ -873,6 +1529,8 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       }
 
       set({ playMode: next });
+      syncRepeatMode();
+      scheduleNextPreload(200);
       const labels: Record<PlayMode, string> = {
         sequence: '列表循环',
         random: '随机播放',
@@ -890,12 +1548,13 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         get().showToast('正在切换音质并无感续播...');
         await loadSongAt(currentTrack, currentTime);
       } else {
+        scheduleNextPreload(200);
         get().showToast('音质偏好已保存');
       }
     },
 
     setSearchSource: (src) => {
-      localStorage.setItem('cp_search_source', src);
+      safeStorageSet('cp_search_source', src);
       set({ searchSource: src });
       const q = get().searchQuery.trim();
       if (q) void get().executeSearch(q, src);
@@ -914,11 +1573,14 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       const controller = new AbortController();
       searchAbort = controller;
 
-      set({ searching: true, searchError: null });
+      set({
+        searching: true,
+        searchError: null,
+        searchHistory: pushSearchHistory(q),
+      });
       try {
-        // Direct NetEase song ID lookup if pure digits
         if (src === 'wy' && /^\d{5,}$/.test(q)) {
-          const song = await musicService.getSong(q, get().quality, controller.signal);
+          const song = await musicService.getSong(q, effectiveQualityForStore(), controller.signal);
           set({
             searching: false,
             searchResults: [
@@ -944,6 +1606,14 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         get().showToast(msg);
         if (msg.includes('登录')) get().openSheet('account');
       }
+    },
+
+    removeSearchHistory: (term) => {
+      set({ searchHistory: removeSearchHistoryItem(term) });
+    },
+
+    clearAllSearchHistory: () => {
+      set({ searchHistory: clearSearchHistory() });
     },
   };
 });

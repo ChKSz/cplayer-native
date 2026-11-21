@@ -1,6 +1,6 @@
 [package]
 name = "cplayer-native"
-version = "1.0.0"
+version = "1.1.0"
 description = "CPlayer Native Android Music Player built with Tauri 2"
 authors = ["CPlayer"]
 edition = "2021"

@@ -77,6 +77,8 @@ if (existsSync(gradlePath)) {
     implementation("androidx.media3:media3-exoplayer:$media3Version")
     implementation("androidx.media3:media3-session:$media3Version")
     implementation("androidx.media3:media3-common:$media3Version")
+    implementation("androidx.media3:media3-datasource:$media3Version")
+    implementation("androidx.media3:media3-database:$media3Version")
 `;
     if (/dependencies\s*\{/.test(gradle)) {
       gradle = gradle.replace(/dependencies\s*\{/, (match) => `${match}\n${media3Deps}`);
@@ -85,6 +87,13 @@ if (existsSync(gradlePath)) {
     }
     gradleChanged = true;
     console.log('[patch-android] Added AndroidX Media3 dependencies to build.gradle.kts');
+  } else if (!gradle.includes('androidx.media3:media3-datasource')) {
+    gradle = gradle.replace(
+      'implementation("androidx.media3:media3-common:$media3Version")',
+      `implementation("androidx.media3:media3-common:$media3Version")\n    implementation("androidx.media3:media3-datasource:$media3Version")\n    implementation("androidx.media3:media3-database:$media3Version")`,
+    );
+    gradleChanged = true;
+    console.log('[patch-android] Added Media3 datasource/database cache dependencies to build.gradle.kts');
   }
 
   // Strip debug symbols from debug .so as well (prevents 120+ MB unstripped Rust .so in debug APKs)
@@ -158,6 +167,7 @@ if (existsSync(manifestPath)) {
   let manifest = readFileSync(manifestPath, 'utf8');
   const requiredPerms = [
     'android.permission.INTERNET',
+    'android.permission.ACCESS_NETWORK_STATE',
     'android.permission.WAKE_LOCK',
     'android.permission.FOREGROUND_SERVICE',
     'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK',
@@ -191,46 +201,279 @@ if (existsSync(manifestPath)) {
   console.log('[patch-android] Patched AndroidManifest.xml');
 }
 
-// 4. Generate CPlayerPlaybackService.kt (ExoPlayer + MediaSessionService + Background Keep-Alive)
+// 4. Generate CPlayerPlaybackService.kt (ExoPlayer + 500MB SimpleCache + Native Sleep Timer + MediaSessionService)
 const playbackServiceKotlin = `package top.chksz.cplayer
 
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.ForwardingPlayer
+import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import java.io.File
+
+@OptIn(UnstableApi::class)
+object CPlayerMediaCache {
+  private const val MAX_CACHE_BYTES: Long = 500L * 1024L * 1024L
+  private var simpleCache: SimpleCache? = null
+
+  @Synchronized
+  fun getCache(context: Context): SimpleCache {
+    val existing = simpleCache
+    if (existing != null) return existing
+    val appCtx = context.applicationContext
+    val dir = File(appCtx.cacheDir, "cplayer_audio_cache")
+    val evictor = LeastRecentlyUsedCacheEvictor(MAX_CACHE_BYTES)
+    val dbProvider = StandaloneDatabaseProvider(appCtx)
+    val created = SimpleCache(dir, evictor, dbProvider)
+    simpleCache = created
+    return created
+  }
+
+  @Synchronized
+  fun getCacheSizeBytes(context: Context): Long {
+    return try {
+      getCache(context).cacheSpace
+    } catch (_: Exception) {
+      0L
+    }
+  }
+
+  @Synchronized
+  fun clearCache(context: Context): Boolean {
+    return try {
+      val cache = getCache(context)
+      val keys = cache.keys.toList()
+      for (key in keys) {
+        cache.removeResource(key)
+      }
+      true
+    } catch (_: Exception) {
+      false
+    }
+  }
+}
 
 @OptIn(UnstableApi::class)
 class CPlayerPlaybackService : MediaSessionService() {
   companion object {
     @Volatile
+    var instance: CPlayerPlaybackService? = null
+
+    @Volatile
     var onRemoteSkip: ((String) -> Unit)? = null
+
+    @Volatile
+    var onAutoTrackTransition: ((String) -> Unit)? = null
+
+    @Volatile
+    var onNativeEnded: (() -> Unit)? = null
+
+    @Volatile
+    var onSleepTimerFired: ((String) -> Unit)? = null
   }
 
-  private lateinit var exoPlayer: ExoPlayer
+  private val serviceHandler = Handler(Looper.getMainLooper())
+  private var exoPlayer: ExoPlayer? = null
   private var mediaSession: MediaSession? = null
+
+  @Volatile
+  private var desiredRepeatOne: Boolean = false
+
+  @Volatile
+  private var stopAfterCurrentTrack: Boolean = false
+
+  @Volatile
+  private var sleepEndElapsedMs: Long = 0L
+
+  private var fadeStepIndex: Int = 0
+  private var sleepFadeStartRunnable: Runnable? = null
+  private var sleepFadeStepRunnable: Runnable? = null
+
+  private fun cancelTimedSleepRunnables() {
+    sleepFadeStartRunnable?.let { serviceHandler.removeCallbacks(it) }
+    sleepFadeStepRunnable?.let { serviceHandler.removeCallbacks(it) }
+    sleepFadeStartRunnable = null
+    sleepFadeStepRunnable = null
+    sleepEndElapsedMs = 0L
+  }
+
+  private fun startFadeOutAndPause() {
+    val player = exoPlayer ?: return
+    fadeStepIndex = 0
+    val totalSteps = 15
+    val stepDelayMs = 200L
+    val runnable = object : Runnable {
+      override fun run() {
+        val activePlayer = exoPlayer ?: return
+        fadeStepIndex++
+        if (fadeStepIndex >= totalSteps) {
+          activePlayer.pause()
+          activePlayer.volume = 1f
+          sleepEndElapsedMs = 0L
+          sleepFadeStepRunnable = null
+          onSleepTimerFired?.invoke("timed")
+          return
+        }
+        val vol = ((totalSteps - fadeStepIndex).toFloat() / totalSteps.toFloat()).coerceIn(0f, 1f)
+        activePlayer.volume = vol
+        serviceHandler.postDelayed(this, stepDelayMs)
+      }
+    }
+    sleepFadeStepRunnable = runnable
+    serviceHandler.post(runnable)
+  }
+
+  fun setNextItem(item: MediaItem) {
+    serviceHandler.post {
+      val player = exoPlayer ?: return@post
+      if (stopAfterCurrentTrack || player.repeatMode == Player.REPEAT_MODE_ONE) return@post
+      if (player.mediaItemCount == 0) return@post
+      val targetIdx = player.currentMediaItemIndex + 1
+      if (player.mediaItemCount > targetIdx) {
+        player.removeMediaItems(targetIdx, player.mediaItemCount)
+      }
+      player.addMediaItem(item)
+    }
+  }
+
+  fun clearNextItem() {
+    serviceHandler.post {
+      val player = exoPlayer ?: return@post
+      val targetIdx = player.currentMediaItemIndex + 1
+      if (player.mediaItemCount > targetIdx) {
+        player.removeMediaItems(targetIdx, player.mediaItemCount)
+      }
+    }
+  }
+
+  fun setRepeatOne(enabled: Boolean) {
+    desiredRepeatOne = enabled
+    serviceHandler.post {
+      val player = exoPlayer ?: return@post
+      if (stopAfterCurrentTrack) {
+        player.repeatMode = Player.REPEAT_MODE_OFF
+      } else {
+        player.repeatMode = if (enabled) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+      }
+      if (enabled) {
+        val targetIdx = player.currentMediaItemIndex + 1
+        if (player.mediaItemCount > targetIdx) {
+          player.removeMediaItems(targetIdx, player.mediaItemCount)
+        }
+      }
+    }
+  }
+
+  fun configureSleepTimer(mode: String, durationMs: Long) {
+    serviceHandler.post {
+      val player = exoPlayer ?: return@post
+      cancelTimedSleepRunnables()
+      player.volume = 1f
+      when (mode) {
+        "track" -> {
+          stopAfterCurrentTrack = true
+          player.repeatMode = Player.REPEAT_MODE_OFF
+          val targetIdx = player.currentMediaItemIndex + 1
+          if (player.mediaItemCount > targetIdx) {
+            player.removeMediaItems(targetIdx, player.mediaItemCount)
+          }
+        }
+        "timed" -> {
+          stopAfterCurrentTrack = false
+          player.repeatMode = if (desiredRepeatOne) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+          if (durationMs > 0L) {
+            sleepEndElapsedMs = SystemClock.elapsedRealtime() + durationMs
+            val fadeStartDelay = (durationMs - 3000L).coerceAtLeast(0L)
+            val starter = Runnable { startFadeOutAndPause() }
+            sleepFadeStartRunnable = starter
+            serviceHandler.postDelayed(starter, fadeStartDelay)
+          }
+        }
+        else -> {
+          stopAfterCurrentTrack = false
+          player.repeatMode = if (desiredRepeatOne) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+        }
+      }
+    }
+  }
+
+  fun getSleepTimerRemainingMs(): Long {
+    val end = sleepEndElapsedMs
+    if (end <= 0L) return 0L
+    return (end - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+  }
 
   override fun onCreate() {
     super.onCreate()
+    instance = this
 
     val audioAttrs = AudioAttributes.Builder()
       .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
       .setUsage(C.USAGE_MEDIA)
       .build()
 
-    exoPlayer = ExoPlayer.Builder(this)
+    val httpFactory = DefaultHttpDataSource.Factory()
+      .setUserAgent("CPlayer-Native/1.0 (Android; Media3)")
+      .setAllowCrossProtocolRedirects(true)
+      .setConnectTimeoutMs(15_000)
+      .setReadTimeoutMs(20_000)
+
+    val cacheFactory = CacheDataSource.Factory()
+      .setCache(CPlayerMediaCache.getCache(this))
+      .setUpstreamDataSourceFactory(httpFactory)
+      .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+
+    val player = ExoPlayer.Builder(this)
+      .setMediaSourceFactory(DefaultMediaSourceFactory(cacheFactory))
       .setAudioAttributes(audioAttrs, true)
       .setHandleAudioBecomingNoisy(true)
       .setWakeMode(C.WAKE_MODE_NETWORK)
       .build()
+    exoPlayer = player
 
-    val sessionPlayer = object : ForwardingPlayer(exoPlayer) {
+    player.addListener(object : Player.Listener {
+      override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+        if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO && mediaItem != null) {
+          val curIdx = player.currentMediaItemIndex
+          if (curIdx > 0) {
+            player.removeMediaItems(0, curIdx)
+          }
+          onAutoTrackTransition?.invoke(mediaItem.mediaId)
+        }
+      }
+
+      override fun onPlaybackStateChanged(playbackState: Int) {
+        if (playbackState == Player.STATE_ENDED) {
+          if (stopAfterCurrentTrack) {
+            stopAfterCurrentTrack = false
+            player.playWhenReady = false
+            player.repeatMode = if (desiredRepeatOne) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+            onSleepTimerFired?.invoke("track")
+          } else {
+            onNativeEnded?.invoke()
+          }
+        }
+      }
+    })
+
+    val sessionPlayer = object : ForwardingPlayer(player) {
       override fun getAvailableCommands(): Player.Commands {
         return super.getAvailableCommands().buildUpon()
           .add(COMMAND_SEEK_TO_NEXT)
@@ -282,15 +525,18 @@ class CPlayerPlaybackService : MediaSessionService() {
   }
 
   override fun onTaskRemoved(rootIntent: Intent?) {
-    val player = mediaSession?.player
+    val player = exoPlayer
     if (player == null || !player.playWhenReady || player.mediaItemCount == 0) {
       stopSelf()
     }
   }
 
   override fun onDestroy() {
+    cancelTimedSleepRunnables()
+    instance = null
     mediaSession?.run {
-      exoPlayer.release()
+      exoPlayer?.release()
+      exoPlayer = null
       release()
       mediaSession = null
     }
@@ -304,8 +550,10 @@ const mainActivityKotlin = `package top.chksz.cplayer
 
 import android.Manifest
 import android.content.ComponentName
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -371,6 +619,15 @@ class MainActivity : TauriActivity() {
   private fun emitJs(script: String) {
     mainHandler.post {
       webViewRef?.evaluateJavascript(script, null)
+    }
+  }
+
+  private fun wakeAndEmitJs(script: String) {
+    mainHandler.post {
+      webViewRef?.let { wv ->
+        wv.resumeTimers()
+        wv.evaluateJavascript(script, null)
+      }
     }
   }
 
@@ -669,34 +926,151 @@ class MainActivity : TauriActivity() {
     }
   }
 
+  private fun buildMediaItem(
+    trackId: String,
+    url: String,
+    title: String,
+    artist: String,
+    album: String,
+    coverUrl: String,
+    cacheKey: String,
+  ): MediaItem {
+    val metaBuilder = MediaMetadata.Builder()
+      .setTitle(title)
+      .setArtist(artist)
+      .setAlbumTitle(album)
+    if (coverUrl.isNotBlank()) {
+      metaBuilder.setArtworkUri(Uri.parse(coverUrl))
+    }
+    val builder = MediaItem.Builder()
+      .setMediaId(trackId)
+      .setUri(url)
+      .setMediaMetadata(metaBuilder.build())
+    if (cacheKey.isNotBlank()) {
+      builder.setCustomCacheKey(cacheKey)
+    }
+    return builder.build()
+  }
+
   inner class NativeMediaBridge {
     @JavascriptInterface
     fun isAvailable(): Boolean = true
 
     @JavascriptInterface
     fun loadAndPlay(
+      trackId: String,
       url: String,
       title: String,
       artist: String,
       album: String,
       coverUrl: String,
       startMs: Long,
+      cacheKey: String,
     ) {
+      val item = buildMediaItem(trackId, url, title, artist, album, coverUrl, cacheKey)
       withController { ctrl ->
-        val metaBuilder = MediaMetadata.Builder()
-          .setTitle(title)
-          .setArtist(artist)
-          .setAlbumTitle(album)
-        if (coverUrl.isNotBlank()) {
-          metaBuilder.setArtworkUri(Uri.parse(coverUrl))
-        }
-        val item = MediaItem.Builder()
-          .setUri(url)
-          .setMediaMetadata(metaBuilder.build())
-          .build()
         ctrl.setMediaItem(item, startMs.coerceAtLeast(0L))
         ctrl.prepare()
         ctrl.play()
+      }
+    }
+
+    @JavascriptInterface
+    fun setNextMediaItem(
+      trackId: String,
+      url: String,
+      title: String,
+      artist: String,
+      album: String,
+      coverUrl: String,
+      cacheKey: String,
+    ) {
+      val item = buildMediaItem(trackId, url, title, artist, album, coverUrl, cacheKey)
+      val svc = CPlayerPlaybackService.instance
+      if (svc != null) {
+        svc.setNextItem(item)
+      } else {
+        withController { ctrl ->
+          if (ctrl.mediaItemCount > 0) {
+            val nextIdx = ctrl.currentMediaItemIndex + 1
+            if (ctrl.mediaItemCount > nextIdx) {
+              ctrl.removeMediaItems(nextIdx, ctrl.mediaItemCount)
+            }
+            ctrl.addMediaItem(item)
+          }
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun clearNextMediaItem() {
+      val svc = CPlayerPlaybackService.instance
+      if (svc != null) {
+        svc.clearNextItem()
+      } else {
+        withController { ctrl ->
+          val nextIdx = ctrl.currentMediaItemIndex + 1
+          if (ctrl.mediaItemCount > nextIdx) {
+            ctrl.removeMediaItems(nextIdx, ctrl.mediaItemCount)
+          }
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun setRepeatOne(enabled: Boolean) {
+      val svc = CPlayerPlaybackService.instance
+      if (svc != null) {
+        svc.setRepeatOne(enabled)
+      } else {
+        withController { ctrl ->
+          ctrl.repeatMode = if (enabled) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun setSleepTimer(mode: String, durationMs: Long) {
+      CPlayerPlaybackService.instance?.configureSleepTimer(mode, durationMs)
+    }
+
+    @JavascriptInterface
+    fun getSleepTimerRemainingMs(): Long {
+      return CPlayerPlaybackService.instance?.getSleepTimerRemainingMs() ?: 0L
+    }
+
+    @JavascriptInterface
+    fun getAudioCacheBytes(): Long {
+      return CPlayerMediaCache.getCacheSizeBytes(applicationContext)
+    }
+
+    @JavascriptInterface
+    fun clearAudioCache(): Boolean {
+      return CPlayerMediaCache.clearCache(applicationContext)
+    }
+
+    @JavascriptInterface
+    fun isMeteredNetwork(): Boolean {
+      return try {
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        cm.isActiveNetworkMetered
+      } catch (_: Exception) {
+        false
+      }
+    }
+
+    @JavascriptInterface
+    fun openExternalUrl(url: String): Boolean {
+      return try {
+        val parsed = Uri.parse(url)
+        if (!parsed.scheme.equals("https", ignoreCase = true)) return false
+        val intent = Intent(Intent.ACTION_VIEW, parsed).apply {
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(intent)
+        true
+      } catch (_: Exception) {
+        false
       }
     }
 
@@ -765,14 +1139,11 @@ class MainActivity : TauriActivity() {
 
             override fun onPlaybackStateChanged(playbackState: Int) {
               emitPlaybackState()
-              if (playbackState == Player.STATE_ENDED) {
-                emitJs("window.__cplayerNativeBridge?.onEnded?.()")
-              }
             }
 
             override fun onPlayerError(error: PlaybackException) {
-              val msg = JSONObject.quote(error.localizedMessage ?: "音频播放失败")
-              emitJs("window.__cplayerNativeBridge?.onError?.($msg)")
+              val msg = jsStringLiteral(error.localizedMessage ?: "音频播放失败")
+              wakeAndEmitJs("window.__cplayerNativeBridge?.onError?.($msg)")
             }
           })
           pendingAction?.let { action ->
@@ -787,8 +1158,22 @@ class MainActivity : TauriActivity() {
     )
 
     CPlayerPlaybackService.onRemoteSkip = { action ->
-      val quoted = JSONObject.quote(action)
-      emitJs("window.__cplayerNativeBridge?.onRemoteCommand?.($quoted)")
+      val quoted = jsStringLiteral(action)
+      wakeAndEmitJs("window.__cplayerNativeBridge?.onRemoteCommand?.($quoted)")
+    }
+
+    CPlayerPlaybackService.onAutoTrackTransition = { mediaId ->
+      val quoted = jsStringLiteral(mediaId)
+      wakeAndEmitJs("window.__cplayerNativeBridge?.onTrackTransition?.($quoted)")
+    }
+
+    CPlayerPlaybackService.onNativeEnded = {
+      wakeAndEmitJs("window.__cplayerNativeBridge?.onEnded?.()")
+    }
+
+    CPlayerPlaybackService.onSleepTimerFired = { mode ->
+      val quoted = jsStringLiteral(mode)
+      wakeAndEmitJs("window.__cplayerNativeBridge?.onSleepTimerFired?.($quoted)")
     }
 
     // Intercept system back gesture: let web UI close sheets/tabs/flip first,
@@ -823,6 +1208,9 @@ class MainActivity : TauriActivity() {
   override fun onDestroy() {
     mainHandler.removeCallbacks(progressTicker)
     CPlayerPlaybackService.onRemoteSkip = null
+    CPlayerPlaybackService.onAutoTrackTransition = null
+    CPlayerPlaybackService.onNativeEnded = null
+    CPlayerPlaybackService.onSleepTimerFired = null
     controllerFuture?.let { MediaController.releaseFuture(it) }
     controllerFuture = null
     mediaController = null

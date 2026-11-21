@@ -10,6 +10,8 @@ import {
 import { QUALITY_OPTIONS, songSourceOf, type LyricLine } from '../types/music';
 import {
   IconChevronDown,
+  IconClose,
+  IconHeart,
   IconMore,
   IconNext,
   IconPause,
@@ -17,6 +19,7 @@ import {
   IconPrev,
   IconQueue,
   IconRepeat,
+  IconSettings,
   IconUser,
 } from './Icons';
 
@@ -201,6 +204,10 @@ export function PlayerPage() {
   const showVerbatim = usePlayerStore((s) => s.showVerbatim);
   const showTranslation = usePlayerStore((s) => s.showTranslation);
   const showRomaji = usePlayerStore((s) => s.showRomaji);
+  const lyricFontSize = usePlayerStore((s) => s.lyricFontSize);
+  const sleepTimerMode = usePlayerStore((s) => s.sleepTimerMode);
+  const favoriteTrackIds = usePlayerStore((s) => s.favoriteTrackIds);
+  const failedTrackOffer = usePlayerStore((s) => s.failedTrackOffer);
 
   const setShowLyrics = usePlayerStore((s) => s.setShowLyrics);
   const togglePlay = usePlayerStore((s) => s.togglePlay);
@@ -209,6 +216,9 @@ export function PlayerPage() {
   const seekTo = usePlayerStore((s) => s.seekTo);
   const cyclePlayMode = usePlayerStore((s) => s.cyclePlayMode);
   const openSheet = usePlayerStore((s) => s.openSheet);
+  const toggleFavorite = usePlayerStore((s) => s.toggleFavorite);
+  const dismissFailedOffer = usePlayerStore((s) => s.dismissFailedOffer);
+  const switchSourceForTrack = usePlayerStore((s) => s.switchSourceForTrack);
 
   const [scrubTime, setScrubTime] = useState<number | null>(null);
   const [userBrowsing, setUserBrowsing] = useState(false);
@@ -546,6 +556,9 @@ export function PlayerPage() {
 
   const armEngaged = isPlaying && !draggingDisc && !showLyrics;
   const focusedLine = lyrics[focusedLineIdx];
+  const isFavorite = Boolean(
+    currentTrack && favoriteTrackIds.includes(String(currentTrack.id)),
+  );
 
   return (
     <section className="page" data-page="0">
@@ -560,19 +573,33 @@ export function PlayerPage() {
           <IconChevronDown size={12} />
         </button>
 
-        <button
-          type="button"
-          className="icon-btn tap"
-          aria-label="我的与设置"
-          onClick={() => openSheet('account')}
-        >
-          <IconUser size={18} />
-          <span
-            className={`sync-dot ${
-              !user ? 'idle' : syncStatus === 'offline' ? 'offline' : ''
-            }`}
-          />
-        </button>
+        <div className="top-bar-actions">
+          <button
+            type="button"
+            className="icon-btn tap"
+            aria-label="账号与云同步"
+            data-testid="account-btn"
+            onClick={() => openSheet('account')}
+          >
+            <IconUser size={18} />
+            <span
+              className={`sync-dot ${
+                !user ? 'idle' : syncStatus === 'offline' ? 'offline' : ''
+              }`}
+            />
+          </button>
+
+          <button
+            type="button"
+            className="icon-btn tap"
+            aria-label="应用设置"
+            data-testid="settings-btn"
+            onClick={() => openSheet('settings')}
+          >
+            <IconSettings size={18} />
+            {sleepTimerMode !== 'off' && <span className="timer-dot" />}
+          </button>
+        </div>
       </header>
 
       {/* 3D Flip Stage: Front = White Tonearm + 3-Disc Drag Vinyl | Back = NetEase Centerline Lyrics */}
@@ -646,7 +673,7 @@ export function PlayerPage() {
           >
             <div
               ref={lyricsBoxRef}
-              className="lyrics-box"
+              className={`lyrics-box lyric-size-${lyricFontSize}`}
               data-testid="lyrics-box"
               onScroll={handleLyricsUserScroll}
               onWheel={() => scheduleAutoResume()}
@@ -700,6 +727,20 @@ export function PlayerPage() {
                 <div className="empty-box">
                   <span>{currentTrack ? '纯音乐，请欣赏' : '尚未开始播放'}</span>
                   <span style={{ fontSize: 12, opacity: 0.6 }}>轻点屏幕翻回黑胶唱片</span>
+                  {!user && !currentTrack && (
+                    <button
+                      type="button"
+                      className="pill-btn tap"
+                      style={{ marginTop: 6 }}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openSheet('account');
+                      }}
+                    >
+                      登录 CPlayerSync 开启无损同步
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -744,17 +785,66 @@ export function PlayerPage() {
                 : '登录账号开启云歌单与无损聆听'}
           </p>
         </div>
-        {currentTrack && (
+        {currentTrack ? (
+          <div className="meta-actions">
+            <button
+              type="button"
+              className={`icon-btn ghost tap heart-btn ${isFavorite ? 'active' : ''}`}
+              aria-label={isFavorite ? '取消喜欢' : '收藏到我喜欢的音乐'}
+              data-testid="favorite-btn"
+              onClick={() => {
+                void triggerHaptic('selection');
+                void toggleFavorite(currentTrack);
+              }}
+            >
+              <IconHeart size={18} filled={isFavorite} />
+            </button>
+            <button
+              type="button"
+              className="icon-btn ghost tap"
+              aria-label="歌曲操作"
+              onClick={() => openSheet('trackAction', currentTrack)}
+            >
+              <IconMore size={18} />
+            </button>
+          </div>
+        ) : (
+          !user && (
+            <button
+              type="button"
+              className="pill-btn tap"
+              onClick={() => openSheet('account')}
+            >
+              去登录
+            </button>
+          )
+        )}
+      </div>
+
+      {failedTrackOffer && (
+        <div className="failed-banner" data-testid="failed-track-banner">
+          <span className="failed-banner-text">
+            「{failedTrackOffer.name}」当前音源暂不可播
+          </span>
+          <button
+            type="button"
+            className="pill-btn tap"
+            style={{ height: 26, fontSize: 11.5, padding: '0 10px' }}
+            onClick={() => switchSourceForTrack(failedTrackOffer)}
+          >
+            换源试听
+          </button>
           <button
             type="button"
             className="icon-btn ghost tap"
-            aria-label="歌曲操作"
-            onClick={() => openSheet('trackAction', currentTrack)}
+            style={{ width: 24, height: 24 }}
+            aria-label="关闭提示"
+            onClick={() => dismissFailedOffer()}
           >
-            <IconMore size={18} />
+            <IconClose size={14} />
           </button>
-        )}
-      </div>
+        </div>
+      )}
 
       {/* 1:1 Pointer Scrub Progress Bar */}
       <div

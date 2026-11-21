@@ -120,3 +120,40 @@ export async function setCachedLyric(
     }
   });
 }
+
+export async function getDbCacheStats(): Promise<{ playlistCount: number; lyricCount: number }> {
+  const db = await openDb();
+  if (!db) return { playlistCount: 0, lyricCount: 0 };
+  const countStore = (storeName: string): Promise<number> =>
+    new Promise((resolve) => {
+      try {
+        const tx = db.transaction(storeName, 'readonly');
+        const req = tx.objectStore(storeName).count();
+        req.onsuccess = () => resolve(Number(req.result) || 0);
+        req.onerror = () => resolve(0);
+      } catch {
+        resolve(0);
+      }
+    });
+  const [playlistCount, lyricCount] = await Promise.all([
+    countStore('playlists'),
+    countStore('lyrics'),
+  ]);
+  return { playlistCount, lyricCount };
+}
+
+export async function clearDbCaches(): Promise<void> {
+  const db = await openDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(['playlists', 'lyrics'], 'readwrite');
+      tx.objectStore('playlists').clear();
+      tx.objectStore('lyrics').clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}

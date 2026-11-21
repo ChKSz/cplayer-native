@@ -1,4 +1,5 @@
 import { MediaRecovery, type AudioTargetLike } from '../services/mediaRecovery';
+import { buildAudioCacheKey } from '../services/preloadCache';
 import type { SongPlaybackData } from '../types/music';
 import {
   getNativeMediaApi,
@@ -15,6 +16,8 @@ export interface AudioEngineCallbacks {
   onPrev: () => void;
   onNext: () => void;
   resolveExpiredSong: (id: string | number) => Promise<SongPlaybackData>;
+  onNativeTrackTransition?: (trackId: string) => void;
+  onNativeSleepTimerFired?: (mode: 'timed' | 'track') => void;
 }
 
 class NativeAudioProxy extends EventTarget implements AudioTargetLike {
@@ -24,10 +27,9 @@ class NativeAudioProxy extends EventTarget implements AudioTargetLike {
 
 /**
  * Dual-backend audio controller:
- * - On Android APK (with Media3 ExoPlayer + MediaSessionService): delegates playback to
- *   `window.CPlayerNativeMedia` for true background keep-alive, audio focus, lock-screen
- *   notification controls, and hardware FLAC/Hi-Res decoding, while interpolating 60fps
- *   timestamps for verbatim YRC lyrics.
+ * - On Android APK (with Media3 ExoPlayer + 500MB SimpleCache + MediaSessionService):
+ *   delegates playback, preloaded next-item queue, and lock-screen sleep timer to
+ *   `window.CPlayerNativeMedia` so playback never stalls when the screen locks.
  * - On Web/Desktop preview: uses HTML5 `<audio>` + Web MediaSession API.
  * Strictly keeps audio stream requests credential-free.
  */
@@ -59,13 +61,16 @@ export class AudioEngine {
         current: (snap) => this.currentData !== null && String(this.currentData.id) === String(snap.id),
         restore: async (fresh, time, wasPlaying) => {
           this.currentData = fresh;
+          const cacheKey = buildAudioCacheKey(fresh.id, fresh.requestedLevel || fresh.source);
           this.nativeApi?.loadAndPlay(
+            String(fresh.id),
             fresh.url,
             fresh.name || '未知歌曲',
             fresh.artist || '未知歌手',
             fresh.album || 'CPlayer',
             fresh.cover || '',
             Math.max(0, Math.round(time * 1000)),
+            cacheKey,
           );
           if (!wasPlaying) {
             this.nativeApi?.pause();
@@ -113,6 +118,13 @@ export class AudioEngine {
         onRemoteCommand: (action) => {
           if (action === 'prev') this.callbacks.onPrev();
           if (action === 'next') this.callbacks.onNext();
+        },
+        onTrackTransition: (mediaId) => {
+          this.callbacks.onNativeTrackTransition?.(mediaId);
+        },
+        onSleepTimerFired: (mode) => {
+          this.nativePlaying = false;
+          this.callbacks.onNativeSleepTimerFired?.(mode);
         },
       });
       return;
@@ -268,29 +280,33 @@ export class AudioEngine {
     });
   }
 
-  public async loadAndPlay(data: SongPlaybackData, startTime = 0): Promise<void> {
+  public async loadAndPlay(data: SongPlaybackData, startTime = 0, cacheKey?: string): Promise<void> {
     this.recovery.reset();
     this.currentData = data;
     this.callbacks.onBufferingChange(true);
     this.updateMetadata(data);
 
     if (this.nativeApi) {
+      const resolvedKey = cacheKey || buildAudioCacheKey(data.id, data.requestedLevel || data.source);
       this.nativeBasePosSec = Math.max(0, startTime);
       this.nativeSyncedAtPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
       this.nativePlaying = false;
       this.nativeApi.loadAndPlay(
+        String(data.id),
         data.url,
         data.name || '未知歌曲',
         data.artist || '未知歌手',
         data.album || 'CPlayer',
         data.cover || '',
         Math.max(0, Math.round(startTime * 1000)),
+        resolvedKey,
       );
       return;
     }
 
     const audio = this.audio;
     if (!audio) return;
+    audio.volume = 1;
     audio.src = data.url;
     audio.load();
     if (startTime > 0) {
@@ -305,12 +321,134 @@ export class AudioEngine {
     }
   }
 
+  /**
+   * Synchronizes JS state when ExoPlayer automatically advances to a preloaded item
+   * in the background without restarting playback.
+   */
+  public syncTransitionedTrack(data: SongPlaybackData): void {
+    this.recovery.reset();
+    this.currentData = data;
+    this.nativeBasePosSec = 0;
+    this.nativeSyncedAtPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    this.nativeDurationSec = 0;
+    this.updateMetadata(data);
+  }
+
+  public setNextPreloadedTrack(data: SongPlaybackData, cacheKey?: string): void {
+    if (!this.nativeApi?.setNextMediaItem) return;
+    const resolvedKey = cacheKey || buildAudioCacheKey(data.id, data.requestedLevel || data.source);
+    try {
+      this.nativeApi.setNextMediaItem(
+        String(data.id),
+        data.url,
+        data.name || '未知歌曲',
+        data.artist || '未知歌手',
+        data.album || 'CPlayer',
+        data.cover || '',
+        resolvedKey,
+      );
+    } catch {
+      // Ignore bridge errors
+    }
+  }
+
+  public clearNextPreloadedTrack(): void {
+    try {
+      this.nativeApi?.clearNextMediaItem?.();
+    } catch {
+      // Ignore bridge errors
+    }
+  }
+
+  public setRepeatOne(enabled: boolean): void {
+    try {
+      this.nativeApi?.setRepeatOne?.(enabled);
+    } catch {
+      // Ignore bridge errors
+    }
+  }
+
+  public setNativeSleepTimer(mode: 'off' | 'timed' | 'track', durationMs: number): boolean {
+    if (!this.nativeApi?.setSleepTimer) return false;
+    try {
+      this.nativeApi.setSleepTimer(mode, Math.max(0, Math.round(durationMs)));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public getNativeSleepTimerRemainingMs(): number {
+    try {
+      return this.nativeApi?.getSleepTimerRemainingMs?.() ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  public getAudioCacheBytes(): number {
+    try {
+      return this.nativeApi?.getAudioCacheBytes?.() ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  public clearAudioCache(): boolean {
+    try {
+      return Boolean(this.nativeApi?.clearAudioCache?.());
+    } catch {
+      return false;
+    }
+  }
+
+  public isMeteredNetwork(): boolean {
+    if (this.nativeApi?.isMeteredNetwork) {
+      try {
+        return Boolean(this.nativeApi.isMeteredNetwork());
+      } catch {
+        return false;
+      }
+    }
+    if (typeof navigator !== 'undefined') {
+      const nav = navigator as Navigator & {
+        connection?: { type?: string; saveData?: boolean };
+      };
+      if (nav.connection) {
+        return nav.connection.type === 'cellular' || Boolean(nav.connection.saveData);
+      }
+    }
+    return false;
+  }
+
+  public openExternalUrl(url: string): boolean {
+    if (this.nativeApi?.openExternalUrl) {
+      try {
+        if (this.nativeApi.openExternalUrl(url)) return true;
+      } catch {
+        // Fallback below
+      }
+    }
+    if (typeof window !== 'undefined' && typeof window.open === 'function') {
+      window.open(url, '_blank', 'noopener,noreferrer');
+      return true;
+    }
+    return false;
+  }
+
+  public setVolume(volume: number): void {
+    if (this.audio) {
+      this.audio.volume = Math.max(0, Math.min(1, volume));
+    }
+  }
+
   public async play(): Promise<void> {
     if (this.nativeApi) {
       this.nativeApi.play();
       return;
     }
     if (!this.audio || !this.audio.src) return;
+    this.audio.volume = 1;
     await this.audio.play();
   }
 
