@@ -4,8 +4,11 @@ import { join } from 'node:path';
 const androidRoot = join(process.cwd(), 'src-tauri', 'gen', 'android');
 const buildSrcDir = join(androidRoot, 'buildSrc');
 const buildSrcSettingsPath = join(buildSrcDir, 'settings.gradle.kts');
+const buildSrcGradlePath = join(buildSrcDir, 'build.gradle.kts');
+const rootGradlePath = join(androidRoot, 'build.gradle.kts');
 const gradlePath = join(androidRoot, 'app', 'build.gradle.kts');
 const proguardPath = join(androidRoot, 'app', 'proguard-cplayer.pro');
+const GCS_MAVEN_CENTRAL = 'https://maven-central.storage-download.googleapis.com/maven2/';
 const manifestPath = join(androidRoot, 'app', 'src', 'main', 'AndroidManifest.xml');
 const pkgDir = join(
   androidRoot,
@@ -25,21 +28,43 @@ if (!existsSync(androidRoot)) {
   process.exit(1);
 }
 
-// 0. Ensure buildSrc has its own settings.gradle.kts so Gradle 9 resolves Kotlin DSL deps via Maven Central
+// 0. Ensure buildSrc and root Gradle resolve Maven Central via Google's GCS mirror first
+// (avoids Maven Central / Cloudflare edge 404/rate-limit issues on GitHub Actions runners)
 if (existsSync(buildSrcDir)) {
   const buildSrcSettings = `pluginManagement {
     repositories {
-        mavenCentral()
-        gradlePluginPortal()
+        maven {
+            name = "GoogleMavenCentralMirror"
+            url = uri("${GCS_MAVEN_CENTRAL}")
+        }
         google()
+        gradlePluginPortal()
+        mavenCentral()
     }
 }
 
 rootProject.name = "buildSrc"
 `;
   writeFileSync(buildSrcSettingsPath, buildSrcSettings, 'utf8');
-  console.log('[patch-android] Wrote buildSrc/settings.gradle.kts');
+  console.log('[patch-android] Wrote buildSrc/settings.gradle.kts with Google GCS Maven mirror');
 }
+
+function injectGcsMirror(filePath, label) {
+  if (!existsSync(filePath)) return;
+  const content = readFileSync(filePath, 'utf8');
+  if (content.includes('maven-central.storage-download.googleapis.com')) return;
+  const patched = content.replace(
+    /^([ \t]*)mavenCentral\(\)/gm,
+    `$1maven { url = uri("${GCS_MAVEN_CENTRAL}") }\n$1mavenCentral()`,
+  );
+  if (patched !== content) {
+    writeFileSync(filePath, patched, 'utf8');
+    console.log(`[patch-android] Added Google GCS Maven mirror to ${label}`);
+  }
+}
+
+injectGcsMirror(buildSrcGradlePath, 'buildSrc/build.gradle.kts');
+injectGcsMirror(rootGradlePath, 'build.gradle.kts');
 
 // 1. Patch app/build.gradle.kts with AndroidX Media3 dependencies & APK size optimizations
 if (existsSync(gradlePath)) {

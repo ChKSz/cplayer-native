@@ -70,6 +70,56 @@ jobs:
           workspaces: src-tauri -> target
           prefix-key: android-aarch64
 
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('package-lock.json', 'scripts/patch-android.mjs') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Configure Gradle Maven Central mirror
+        run: |
+          echo -n "Google GCS Maven mirror status: "
+          curl -sS -o /dev/null -w "%{http_code}\n" "https://maven-central.storage-download.googleapis.com/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.3.21/kotlin-stdlib-2.3.21.pom" || true
+          echo -n "Maven Central (apache) status: "
+          curl -sS -o /dev/null -w "%{http_code}\n" "https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.3.21/kotlin-stdlib-2.3.21.pom" || true
+          mkdir -p "${HOME}/.gradle/init.d"
+          cat > "${HOME}/.gradle/init.d/maven-mirrors.gradle" <<'EOF'
+          def gcsMirror = java.net.URI.create("https://maven-central.storage-download.googleapis.com/maven2/")
+
+          gradle.beforeSettings { settings ->
+              settings.pluginManagement {
+                  repositories {
+                      maven {
+                          name = "GoogleMavenCentralMirror"
+                          url = gcsMirror
+                      }
+                      google()
+                      gradlePluginPortal()
+                      mavenCentral()
+                  }
+              }
+          }
+
+          gradle.allprojects { project ->
+              project.buildscript.repositories {
+                  maven {
+                      name = "GoogleMavenCentralMirror"
+                      url = gcsMirror
+                  }
+              }
+              project.repositories {
+                  maven {
+                      name = "GoogleMavenCentralMirror"
+                      url = gcsMirror
+                  }
+              }
+          }
+          EOF
+
       - name: Initialize Tauri Android project & apply native patches
         run: |
           npx tauri android init --ci
