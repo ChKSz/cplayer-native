@@ -1,7 +1,9 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const androidRoot = join(process.cwd(), 'src-tauri', 'gen', 'android');
+const resValuesDir = join(androidRoot, 'app', 'src', 'main', 'res', 'values');
+const launcherBgXmlPath = join(resValuesDir, 'ic_launcher_background.xml');
 const buildSrcDir = join(androidRoot, 'buildSrc');
 const buildSrcSettingsPath = join(buildSrcDir, 'settings.gradle.kts');
 const buildSrcGradlePath = join(buildSrcDir, 'build.gradle.kts');
@@ -27,6 +29,16 @@ if (!existsSync(androidRoot)) {
   console.error('[patch-android] src-tauri/gen/android not found. Run `npx tauri android init` first.');
   process.exit(1);
 }
+
+// 0a. Ensure Android adaptive icon background matches CPlayer green (#66BB6A)
+mkdirSync(resValuesDir, { recursive: true });
+const launcherBgXml = `<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <color name="ic_launcher_background">#66BB6A</color>
+</resources>
+`;
+writeFileSync(launcherBgXmlPath, launcherBgXml, 'utf8');
+console.log('[patch-android] Ensured res/values/ic_launcher_background.xml (#66BB6A)');
 
 // 0. Ensure buildSrc and root Gradle resolve Maven Central via Google's GCS mirror first
 // (avoids Maven Central / Cloudflare edge 404/rate-limit issues on GitHub Actions runners)
@@ -218,8 +230,10 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.ExoPlayer
@@ -227,6 +241,9 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicLong
 
 @OptIn(UnstableApi::class)
 object CPlayerMediaCache {
@@ -290,6 +307,16 @@ class CPlayerPlaybackService : MediaSessionService() {
   }
 
   private val serviceHandler = Handler(Looper.getMainLooper())
+  private val preCacheExecutor = Executors.newSingleThreadExecutor()
+  private val preCacheGeneration = AtomicLong(0L)
+  private var cacheDataSourceFactory: CacheDataSource.Factory? = null
+
+  @Volatile
+  private var activePreCacheWriter: CacheWriter? = null
+
+  @Volatile
+  private var activePreCacheFuture: Future<*>? = null
+
   private var exoPlayer: ExoPlayer? = null
   private var mediaSession: MediaSession? = null
 
@@ -340,6 +367,63 @@ class CPlayerPlaybackService : MediaSessionService() {
     serviceHandler.post(runnable)
   }
 
+  fun cancelPreCache() {
+    preCacheGeneration.incrementAndGet()
+    try {
+      activePreCacheWriter?.cancel()
+    } catch (_: Exception) {
+    }
+    activePreCacheWriter = null
+    activePreCacheFuture?.cancel(true)
+    activePreCacheFuture = null
+  }
+
+  fun preCacheMediaItem(item: MediaItem) {
+    val factory = cacheDataSourceFactory ?: return
+    val uri = item.localConfiguration?.uri ?: return
+    val cacheKey = item.localConfiguration?.customCacheKey ?: item.mediaId
+    if (cacheKey.isBlank()) return
+
+    val gen = preCacheGeneration.incrementAndGet()
+    try {
+      activePreCacheWriter?.cancel()
+    } catch (_: Exception) {
+    }
+    activePreCacheWriter = null
+    activePreCacheFuture?.cancel(true)
+
+    val preCacheBytes = 6L * 1024L * 1024L
+    activePreCacheFuture = preCacheExecutor.submit {
+      if (preCacheGeneration.get() != gen) return@submit
+      try {
+        val cache = CPlayerMediaCache.getCache(this)
+        val alreadyCached = cache.getCachedBytes(cacheKey, 0L, preCacheBytes)
+        if (alreadyCached >= preCacheBytes) return@submit
+
+        val dataSpec = DataSpec.Builder()
+          .setUri(uri)
+          .setKey(cacheKey)
+          .setPosition(0L)
+          .setLength(preCacheBytes)
+          .build()
+
+        val writer = CacheWriter(factory.createDataSource(), dataSpec, null, null)
+        activePreCacheWriter = writer
+        if (preCacheGeneration.get() != gen) {
+          writer.cancel()
+          return@submit
+        }
+        writer.cache()
+      } catch (_: Exception) {
+        // Silent best-effort background pre-caching
+      } finally {
+        if (preCacheGeneration.get() == gen) {
+          activePreCacheWriter = null
+        }
+      }
+    }
+  }
+
   fun setNextItem(item: MediaItem) {
     serviceHandler.post {
       val player = exoPlayer ?: return@post
@@ -350,10 +434,12 @@ class CPlayerPlaybackService : MediaSessionService() {
         player.removeMediaItems(targetIdx, player.mediaItemCount)
       }
       player.addMediaItem(item)
+      preCacheMediaItem(item)
     }
   }
 
   fun clearNextItem() {
+    cancelPreCache()
     serviceHandler.post {
       val player = exoPlayer ?: return@post
       val targetIdx = player.currentMediaItemIndex + 1
@@ -439,6 +525,7 @@ class CPlayerPlaybackService : MediaSessionService() {
       .setCache(CPlayerMediaCache.getCache(this))
       .setUpstreamDataSourceFactory(httpFactory)
       .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+    cacheDataSourceFactory = cacheFactory
 
     val player = ExoPlayer.Builder(this)
       .setMediaSourceFactory(DefaultMediaSourceFactory(cacheFactory))
@@ -533,6 +620,9 @@ class CPlayerPlaybackService : MediaSessionService() {
 
   override fun onDestroy() {
     cancelTimedSleepRunnables()
+    cancelPreCache()
+    preCacheExecutor.shutdownNow()
+    cacheDataSourceFactory = null
     instance = null
     mediaSession?.run {
       exoPlayer?.release()
@@ -968,6 +1058,7 @@ class MainActivity : TauriActivity() {
       cacheKey: String,
     ) {
       val item = buildMediaItem(trackId, url, title, artist, album, coverUrl, cacheKey)
+      CPlayerPlaybackService.instance?.cancelPreCache()
       withController { ctrl ->
         ctrl.setMediaItem(item, startMs.coerceAtLeast(0L))
         ctrl.prepare()
@@ -997,6 +1088,7 @@ class MainActivity : TauriActivity() {
               ctrl.removeMediaItems(nextIdx, ctrl.mediaItemCount)
             }
             ctrl.addMediaItem(item)
+            CPlayerPlaybackService.instance?.preCacheMediaItem(item)
           }
         }
       }

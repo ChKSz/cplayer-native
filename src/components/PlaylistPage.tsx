@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { triggerHaptic } from '../services/transport';
 import { trackCoverOrFallback, usePlayerStore } from '../stores/usePlayerStore';
 import { songSourceOf } from '../types/music';
 import {
@@ -35,9 +36,24 @@ export function PlaylistPage() {
   const [filterQuery, setFilterQuery] = useState('');
   const [visibleCount, setVisibleCount] = useState(PAGE_CHUNK);
   const [savingToCloud, setSavingToCloud] = useState(false);
+  const [isListScrolling, setIsListScrolling] = useState(false);
+  const [draggingThumb, setDraggingThumb] = useState(false);
+  const [scrubPreview, setScrubPreview] = useState<{
+    index: number;
+    total: number;
+    title: string;
+  } | null>(null);
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const activeRowRef = useRef<HTMLDivElement | null>(null);
+  const railRef = useRef<HTMLDivElement | null>(null);
+  const thumbRef = useRef<HTMLDivElement | null>(null);
+  const scrollIdleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const thumbDragRef = useRef<{
+    id: number;
+    ratio: number;
+    lastHapticBucket: number;
+  } | null>(null);
 
   useEffect(() => {
     setFilterQuery('');
@@ -88,6 +104,122 @@ export function PlaylistPage() {
     [filteredEntries, visibleCount],
   );
 
+  const showFastScroll = !loadingPlaylist && filteredEntries.length > 10;
+
+  const positionThumbAtRatio = useCallback((ratio: number) => {
+    const rail = railRef.current;
+    const thumb = thumbRef.current;
+    if (!rail || !thumb) return;
+    const clamped = Math.max(0, Math.min(1, ratio));
+    const pad = 8;
+    const thumbH = thumb.offsetHeight || 44;
+    const travel = Math.max(0, rail.clientHeight - pad * 2 - thumbH);
+    const y = pad + clamped * travel;
+    thumb.style.transform = `translate3d(0, ${y.toFixed(1)}px, 0)`;
+  }, []);
+
+  const syncThumbFromScroll = useCallback(() => {
+    if (thumbDragRef.current) return;
+    const el = listRef.current;
+    if (!el || filteredEntries.length === 0) return;
+    const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+    if (maxScroll <= 0) {
+      positionThumbAtRatio(0);
+      return;
+    }
+    const loadedFrac = Math.min(1, visibleCount / filteredEntries.length);
+    const ratio = (el.scrollTop / maxScroll) * loadedFrac;
+    positionThumbAtRatio(ratio);
+  }, [filteredEntries.length, positionThumbAtRatio, visibleCount]);
+
+  useEffect(() => {
+    syncThumbFromScroll();
+  }, [syncThumbFromScroll, activePlaylistKey]);
+
+  useLayoutEffect(() => {
+    const drag = thumbDragRef.current;
+    const el = listRef.current;
+    if (!drag || !el) return;
+    const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+    el.scrollTop = drag.ratio * maxScroll;
+    positionThumbAtRatio(drag.ratio);
+  }, [visibleCount, positionThumbAtRatio]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollIdleRef.current) clearTimeout(scrollIdleRef.current);
+    };
+  }, []);
+
+  const applyThumbDragAt = (clientY: number, pointerId: number) => {
+    const rail = railRef.current;
+    const el = listRef.current;
+    if (!rail || !el || filteredEntries.length === 0) return;
+
+    const rect = rail.getBoundingClientRect();
+    const pad = 8;
+    const thumbH = thumbRef.current?.offsetHeight || 44;
+    const travel = Math.max(1, rect.height - pad * 2 - thumbH);
+    const ratio = Math.max(0, Math.min(1, (clientY - rect.top - pad - thumbH / 2) / travel));
+
+    if (visibleCount < filteredEntries.length) {
+      setVisibleCount(filteredEntries.length);
+    }
+
+    const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+    el.scrollTop = ratio * maxScroll;
+    positionThumbAtRatio(ratio);
+
+    const targetIdx = Math.min(
+      filteredEntries.length - 1,
+      Math.max(0, Math.round(ratio * (filteredEntries.length - 1))),
+    );
+    const bucket = Math.floor(ratio * 20);
+    if (thumbDragRef.current && thumbDragRef.current.id === pointerId) {
+      thumbDragRef.current.ratio = ratio;
+      if (bucket !== thumbDragRef.current.lastHapticBucket) {
+        thumbDragRef.current.lastHapticBucket = bucket;
+        void triggerHaptic('selection');
+      }
+    }
+
+    const targetTrack = filteredEntries[targetIdx]?.track;
+    setScrubPreview({
+      index: targetIdx + 1,
+      total: filteredEntries.length,
+      title: targetTrack?.name || '',
+    });
+  };
+
+  const onThumbPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!showFastScroll) return;
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    thumbDragRef.current = { id: e.pointerId, ratio: 0, lastHapticBucket: -1 };
+    setDraggingThumb(true);
+    setIsListScrolling(true);
+    void triggerHaptic('light');
+    applyThumbDragAt(e.clientY, e.pointerId);
+  };
+
+  const onThumbPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = thumbDragRef.current;
+    if (!drag || drag.id !== e.pointerId) return;
+    e.stopPropagation();
+    applyThumbDragAt(e.clientY, e.pointerId);
+  };
+
+  const onThumbPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = thumbDragRef.current;
+    if (!drag || drag.id !== e.pointerId) return;
+    e.stopPropagation();
+    thumbDragRef.current = null;
+    setDraggingThumb(false);
+    setScrubPreview(null);
+    if (scrollIdleRef.current) clearTimeout(scrollIdleRef.current);
+    scrollIdleRef.current = setTimeout(() => setIsListScrolling(false), 900);
+  };
+
   const handleListScroll = () => {
     const el = listRef.current;
     if (!el) return;
@@ -97,6 +229,12 @@ export function PlaylistPage() {
         setVisibleCount((prev) => Math.min(filteredEntries.length, prev + PAGE_CHUNK));
       }
     }
+    syncThumbFromScroll();
+    setIsListScrolling(true);
+    if (scrollIdleRef.current) clearTimeout(scrollIdleRef.current);
+    scrollIdleRef.current = setTimeout(() => {
+      if (!thumbDragRef.current) setIsListScrolling(false);
+    }, 900);
   };
 
   const onSaveNetease = async () => {
@@ -244,13 +382,14 @@ export function PlaylistPage() {
         </div>
       )}
 
-      {/* Track List */}
-      <div
-        ref={listRef}
-        className="track-list"
-        style={{ position: 'relative' }}
-        onScroll={handleListScroll}
-      >
+      {/* Track List + Draggable Dynamic Fast-Scroll Thumb */}
+      <div className="track-list-wrap">
+        <div
+          ref={listRef}
+          className="track-list"
+          style={{ position: 'relative' }}
+          onScroll={handleListScroll}
+        >
         {loadingPlaylist ? (
           <div className="empty-box">
             <span className="spinner" />
@@ -360,6 +499,34 @@ export function PlaylistPage() {
                 >
                   导入网易云歌单
                 </button>
+              )}
+            </div>
+          </div>
+        )}
+        </div>
+
+        {showFastScroll && (
+          <div
+            ref={railRef}
+            className={`playlist-fastscroll-rail ${isListScrolling || draggingThumb ? 'active' : ''} ${draggingThumb ? 'dragging' : ''}`}
+            data-testid="playlist-fastscroll"
+            aria-label="歌单快速定位滑块"
+            onPointerDown={onThumbPointerDown}
+            onPointerMove={onThumbPointerMove}
+            onPointerUp={onThumbPointerUp}
+            onPointerCancel={onThumbPointerUp}
+          >
+            <div ref={thumbRef} className="playlist-fastscroll-thumb">
+              <span className="fastscroll-pill" />
+              {draggingThumb && scrubPreview && (
+                <div className="fastscroll-bubble" data-testid="fastscroll-bubble">
+                  <span className="fastscroll-count">
+                    {scrubPreview.index} / {scrubPreview.total}
+                  </span>
+                  {scrubPreview.title && (
+                    <span className="fastscroll-title">{scrubPreview.title}</span>
+                  )}
+                </div>
               )}
             </div>
           </div>

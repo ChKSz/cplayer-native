@@ -56,7 +56,8 @@ export type ActiveSheetType =
   | 'importNetease'
   | 'createPlaylist'
   | 'playlistManage'
-  | 'trackAction';
+  | 'trackAction'
+  | 'addToPlaylist';
 
 export type LyricFontSize = 'sm' | 'md' | 'lg';
 export type SleepTimerMode = 'off' | '15' | '30' | '60' | 'track';
@@ -203,6 +204,8 @@ export interface PlayerStoreState {
   loadingPlaylist: boolean;
   favoritePlaylistId: string | null;
   favoriteTrackIds: string[];
+  savedCloudTrackIds: string[];
+  cloudTrackPlaylistMap: Record<string, string[]>;
 
   // Playback
   queue: Track[];
@@ -275,10 +278,12 @@ export interface PlayerStoreState {
   selectCloudPlaylist: (id: string, force?: boolean) => Promise<void>;
   importNeteasePlaylist: (input: string) => Promise<void>;
   createCloudPlaylist: (name: string) => Promise<void>;
+  createCloudPlaylistWithTrack: (name: string, track: Track) => Promise<void>;
   renameCloudPlaylist: (id: string, name: string) => Promise<void>;
   deleteCloudPlaylist: (id: string) => Promise<void>;
   saveNeteasePlaylistToCloud: () => Promise<void>;
   addTrackToCloudPlaylist: (playlistId: string, track: Track) => Promise<void>;
+  removeTrackFromCloudPlaylist: (playlistId: string, trackId: string | number) => Promise<void>;
   removeTrackFromActivePlaylist: (trackId: string | number) => Promise<void>;
   toggleFavorite: (track: Track) => Promise<void>;
 
@@ -331,29 +336,72 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     }
   };
 
-  const syncFavoriteSnapshot = (playlists: PlaylistSummary[] = cpSync.mirror.playlists) => {
+  const syncFavoriteSnapshot = (
+    playlists: PlaylistSummary[] = cpSync.mirror.playlists,
+    extraCloudContext?: { playlistId: string | null; tracks: Track[] },
+  ) => {
     const favSummary = playlists.find((p) => p.name.trim() === FAVORITE_PLAYLIST_NAME);
-    if (!favSummary) {
-      set({ favoritePlaylistId: null, favoriteTrackIds: [] });
-      return null;
+    const trackMap: Record<string, string[]> = {};
+    const idSet = new Set<string>();
+
+    const recordTrack = (playlistId: string, trackId: string | number) => {
+      const tid = String(trackId);
+      idSet.add(tid);
+      const list = trackMap[tid];
+      if (!list) {
+        trackMap[tid] = [playlistId];
+      } else if (!list.includes(playlistId)) {
+        list.push(playlistId);
+      }
+    };
+
+    for (const pl of playlists) {
+      const detail = cpSync.mirror.detail[pl.id];
+      if (detail?.tracks?.length) {
+        for (const t of detail.tracks) {
+          recordTrack(pl.id, t.id);
+        }
+      }
     }
-    const detail = cpSync.mirror.detail[favSummary.id];
+
+    // Also include currently loaded/playing cloud playlist tracks immediately
+    const st = get();
+    const ctxPlaylistId = extraCloudContext?.playlistId ?? st.activeCloudPlaylistId;
+    const ctxTracks = extraCloudContext?.tracks ?? (st.activeCloudPlaylistId ? st.activePlaylistTracks : []);
+    if (ctxPlaylistId && ctxTracks.length > 0) {
+      for (const t of ctxTracks) {
+        recordTrack(ctxPlaylistId, t.id);
+      }
+    }
+
+    const allSavedIds = Array.from(idSet);
     set({
-      favoritePlaylistId: favSummary.id,
-      favoriteTrackIds: detail ? detail.tracks.map((t) => String(t.id)) : get().favoriteTrackIds,
+      favoritePlaylistId: favSummary ? favSummary.id : null,
+      favoriteTrackIds: allSavedIds,
+      savedCloudTrackIds: allSavedIds,
+      cloudTrackPlaylistMap: trackMap,
     });
-    return favSummary.id;
+    return favSummary ? favSummary.id : null;
   };
 
+  let preloadingAllCloudDetails = false;
   const preloadFavoritesDetailIfNeeded = async () => {
-    const favId = syncFavoriteSnapshot();
-    if (favId && !cpSync.mirror.detail[favId] && cpSync.isLoggedIn()) {
-      try {
-        await cpSync.getPlaylist(favId, false);
-        syncFavoriteSnapshot();
-      } catch {
-        // Ignore silent background fetch failure
+    syncFavoriteSnapshot();
+    if (!cpSync.isLoggedIn() || preloadingAllCloudDetails) return;
+    const missing = cpSync.mirror.playlists.filter((p) => !cpSync.mirror.detail[p.id]);
+    if (!missing.length) return;
+    preloadingAllCloudDetails = true;
+    try {
+      for (const pl of missing) {
+        try {
+          await cpSync.getPlaylist(pl.id, false);
+          syncFavoriteSnapshot();
+        } catch {
+          // Ignore silent background fetch failure for individual playlists
+        }
       }
+    } finally {
+      preloadingAllCloudDetails = false;
     }
   };
 
@@ -545,7 +593,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
 
     persistPlaybackProgress(mergedTrack);
     void loadLyricsFor(mergedTrack.id, seq);
-    scheduleNextPreload(400);
+    scheduleNextPreload(120);
   };
 
   const ensureAudioEngine = (): AudioEngine => {
@@ -687,7 +735,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       consecutiveAutoSkipErrors = 0;
       persistPlaybackProgress(mergedTrack);
       void loadLyricsFor(mergedTrack.id, seq);
-      scheduleNextPreload(1200);
+      scheduleNextPreload(120);
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       if (seq !== songRequestSeq) return;
@@ -746,6 +794,8 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     loadingPlaylist: false,
     favoritePlaylistId: null,
     favoriteTrackIds: [],
+    savedCloudTrackIds: [],
+    cloudTrackPlaylistMap: {},
 
     queue: [],
     originalQueue: [],
@@ -853,6 +903,9 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       if (activeSheet === 'settings' || activeSheet === 'quality') {
         get().refreshNetworkStatus();
       }
+      if (activeSheet === 'addToPlaylist') {
+        void preloadFavoritesDetailIfNeeded();
+      }
       set({ activeSheet, sheetTrackTarget: track });
     },
     closeSheet: () => set({ activeSheet: null, sheetTrackTarget: null }),
@@ -897,6 +950,8 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         cloudPlaylists: [...cpSync.mirror.playlists],
         favoritePlaylistId: null,
         favoriteTrackIds: [],
+        savedCloudTrackIds: [],
+        cloudTrackPlaylistMap: {},
       });
       get().showToast('已退出登录');
     },
@@ -1040,7 +1095,6 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       try {
         const detail: PlaylistDetail = await cpSync.getPlaylist(id, force);
         const tracks = CPSync.toPlayerTracks(detail.tracks);
-        syncFavoriteSnapshot();
         set({
           activePlaylistKey: `cloud:${detail.id}`,
           activePlaylistName: detail.name,
@@ -1049,6 +1103,7 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
           activeNeteasePlaylistId: null,
           loadingPlaylist: false,
         });
+        syncFavoriteSnapshot(cpSync.mirror.playlists, { playlistId: detail.id, tracks });
       } catch (err) {
         set({ loadingPlaylist: false });
         get().showToast(err instanceof Error ? err.message : '加载云歌单失败');
@@ -1118,6 +1173,31 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
         get().showToast(`已创建歌单「${created.name}」`);
       } catch (err) {
         get().showToast(err instanceof Error ? err.message : '创建歌单失败');
+      }
+    },
+
+    createCloudPlaylistWithTrack: async (name, track) => {
+      const trimmed = name.trim();
+      if (!trimmed) {
+        get().showToast('请输入新歌单名称');
+        return;
+      }
+      if (!cpSync.isLoggedIn()) {
+        get().showToast('请先登录 CPlayerSync 以创建云歌单');
+        get().openSheet('account');
+        return;
+      }
+      try {
+        const created = await cpSync.createPlaylist({ name: trimmed, tracks: [track] });
+        set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+        syncFavoriteSnapshot(cpSync.mirror.playlists, {
+          playlistId: created.id,
+          tracks: [track],
+        });
+        get().closeSheet();
+        get().showToast(`已新建「${created.name}」并存入歌曲`);
+      } catch (err) {
+        get().showToast(err instanceof Error ? err.message : '创建并存入失败');
       }
     },
 
@@ -1198,13 +1278,31 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       try {
         const res = await cpSync.addTracks(playlistId, [track]);
         set({ cloudPlaylists: [...cpSync.mirror.playlists] });
-        syncFavoriteSnapshot();
         if (get().activeCloudPlaylistId === playlistId && res.playlist) {
           set({ activePlaylistTracks: CPSync.toPlayerTracks(res.playlist.tracks) });
         }
-        get().showToast('已加入歌单');
+        syncFavoriteSnapshot();
+        const plName = cpSync.mirror.playlists.find((p) => p.id === playlistId)?.name;
+        get().showToast(plName ? `已加入「${plName}」` : '已加入歌单');
       } catch (err) {
         get().showToast(err instanceof Error ? err.message : '添加失败');
+      }
+    },
+
+    removeTrackFromCloudPlaylist: async (playlistId, trackId) => {
+      try {
+        const res = await cpSync.removeTrack(playlistId, trackId);
+        set({ cloudPlaylists: [...cpSync.mirror.playlists] });
+        if (get().activeCloudPlaylistId === playlistId) {
+          set({
+            activePlaylistTracks: res.playlist ? CPSync.toPlayerTracks(res.playlist.tracks) : [],
+          });
+        }
+        syncFavoriteSnapshot();
+        const plName = cpSync.mirror.playlists.find((p) => p.id === playlistId)?.name;
+        get().showToast(plName ? `已从「${plName}」移除` : '已从歌单移除');
+      } catch (err) {
+        get().showToast(err instanceof Error ? err.message : '移除失败');
       }
     },
 
@@ -1287,6 +1385,12 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
           ? { activeCloudPlaylistId: meta.playlistId ?? get().activeCloudPlaylistId }
           : {}),
       });
+      if (meta?.kind === 'cloud') {
+        syncFavoriteSnapshot(cpSync.mirror.playlists, {
+          playlistId: meta.playlistId ?? get().activeCloudPlaylistId ?? '__active_cloud__',
+          tracks,
+        });
+      }
       if (isRandom) {
         get().showToast('随机播放 · 已按随机顺序打乱列表');
       }

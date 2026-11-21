@@ -9,7 +9,7 @@ import {
 } from '../engine/dockPhysics';
 import { triggerHaptic } from '../services/transport';
 import { trackCoverOrFallback, usePlayerStore } from '../stores/usePlayerStore';
-import { IconDisc, IconMusic, IconPause, IconPlay, IconSearch } from './Icons';
+import { IconDisc, IconMusic, IconPause, IconPlay, IconQueue, IconSearch } from './Icons';
 
 export interface DockExternalSheetHooks {
   beginExternalDrag: (sheetType: 'queue', clientY: number) => void;
@@ -88,6 +88,7 @@ function buildLensDisplacementDataUrl(): string {
 export function DraggableBottomDock({ onVisualProgress, sheetHooks }: DraggableBottomDockProps) {
   const activeTab = usePlayerStore((s) => s.activeTab);
   const setActiveTab = usePlayerStore((s) => s.setActiveTab);
+  const openSheet = usePlayerStore((s) => s.openSheet);
   const currentTrack = usePlayerStore((s) => s.currentTrack);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
   const currentTime = usePlayerStore((s) => s.currentTime);
@@ -98,7 +99,7 @@ export function DraggableBottomDock({ onVisualProgress, sheetHooks }: DraggableB
   const lensRef = useRef<HTMLDivElement | null>(null);
   const portalRef = useRef<HTMLDivElement | null>(null);
   const baseItemRefs = useRef<(HTMLDivElement | null)[]>([]);
-  const orbWrapRef = useRef<HTMLDivElement | null>(null);
+  const orbBtnRef = useRef<HTMLButtonElement | null>(null);
   const dispMapRef = useRef<SVGFEDisplacementMapElement | null>(null);
 
   const dispUrl = useMemo(() => buildLensDisplacementDataUrl(), []);
@@ -157,9 +158,9 @@ export function DraggableBottomDock({ onVisualProgress, sheetHooks }: DraggableB
       if (item) item.classList.toggle('active', i === nearest);
     });
 
-    // Plan A: detach right mini-disc orb smoothly when leaving Tab 0 ("播放")
-    if (orbWrapRef.current) {
-      orbWrapRef.current.classList.toggle('visible', clamped > 0.42);
+    // Keep bottom-right orb always present; morph smoothly between Queue (Tab 0) and Mini-Vinyl (Tabs 1 & 2)
+    if (orbBtnRef.current) {
+      orbBtnRef.current.classList.toggle('mode-player', clamped > 0.45);
     }
 
     if (p.isDragging && nearest !== p.lastHapticTab) {
@@ -365,53 +366,14 @@ export function DraggableBottomDock({ onVisualProgress, sheetHooks }: DraggableB
     ensureAnimLoop();
   };
 
-  // Detached Mini-Vinyl Orb gesture (only visible on Tabs 1 & 2; no premature capture)
-  const orbGestureRef = useRef<{
-    id: number;
-    startX: number;
-    startY: number;
-    draggingSheet: boolean;
-  } | null>(null);
-
-  const onOrbPointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
-    orbGestureRef.current = {
-      id: e.pointerId,
-      startX: e.clientX,
-      startY: e.clientY,
-      draggingSheet: false,
-    };
-  };
-
-  const onOrbPointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
-    const g = orbGestureRef.current;
-    if (!g || e.pointerId !== g.id) return;
-    const dx = e.clientX - g.startX;
-    const dy = e.clientY - g.startY;
-    if (!g.draggingSheet && dy < -20 && Math.abs(dy) > Math.abs(dx) * 1.3) {
-      g.draggingSheet = true;
-      try {
-        e.currentTarget.setPointerCapture(e.pointerId);
-      } catch {
-        // Ignore if pointer already released
-      }
-      sheetHooks.beginExternalDrag('queue', e.clientY);
-    }
-    if (g.draggingSheet) {
-      sheetHooks.moveExternalDrag(e.clientY);
-    }
-  };
-
-  const finishOrbGesture = (e: React.PointerEvent<HTMLButtonElement>, canceled = false) => {
-    const g = orbGestureRef.current;
-    if (!g || e.pointerId !== g.id) return;
-    orbGestureRef.current = null;
-    if (g.draggingSheet) {
-      sheetHooks.endExternalDrag();
-      return;
-    }
-    if (canceled) return;
+  // Persistent bottom-right orb click action (no drag-to-pull-sheet on Tabs 1 & 2)
+  const onOrbClick = () => {
     void triggerHaptic('light');
-    void togglePlay();
+    if (activeTab === 0) {
+      openSheet('queue');
+    } else {
+      void togglePlay();
+    }
   };
 
   const progressRatio = duration > 0 ? Math.max(0, Math.min(1, currentTime / duration)) : 0;
@@ -487,40 +449,43 @@ export function DraggableBottomDock({ onVisualProgress, sheetHooks }: DraggableB
         </div>
       </nav>
 
-      {/* Plan A Companion Orb: collapses symmetrically on Player tab, glides in on Lists/Search */}
-      <div ref={orbWrapRef} className={`dock-orb-wrap ${activeTab > 0 ? 'visible' : ''}`}>
+      {/* Persistent Companion Orb: Queue button on Tab 0, Mini-Vinyl Play/Pause on Tabs 1 & 2 */}
+      <div className="dock-orb-wrap visible">
         <button
+          ref={orbBtnRef}
           type="button"
-          className="dock-orb tap"
-          aria-label={isPlaying ? '暂停播放' : '继续播放'}
-          data-testid="dock-orb"
-          tabIndex={activeTab > 0 ? 0 : -1}
-          onPointerDown={onOrbPointerDown}
-          onPointerMove={onOrbPointerMove}
-          onPointerUp={(e) => finishOrbGesture(e, false)}
-          onPointerCancel={(e) => finishOrbGesture(e, true)}
+          className={`dock-orb tap ${activeTab > 0 ? 'mode-player' : ''}`}
+          aria-label={activeTab === 0 ? '播放队列' : isPlaying ? '暂停播放' : '继续播放'}
+          data-testid={activeTab === 0 ? 'queue-btn' : 'dock-orb'}
+          onClick={onOrbClick}
         >
-          <svg className="orb-ring" viewBox="0 0 58 58">
-            <circle cx="29" cy="29" r="27" fill="none" stroke="rgba(255,255,255,0.12)" strokeWidth="2" />
-            <circle
-              cx="29"
-              cy="29"
-              r="27"
-              fill="none"
-              stroke="rgba(255,255,255,0.88)"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeDasharray="169.65"
-              strokeDashoffset={dashOffset}
-              transform="rotate(-90 29 29)"
-            />
-          </svg>
-          <div className={`orb-mini-disc ${isPlaying ? 'playing' : ''}`}>
-            <img src={trackCoverOrFallback(currentTrack)} alt="" />
-            <div className="orb-mini-mask">
-              {isPlaying ? <IconPause size={15} /> : <IconPlay size={15} />}
+          <span className="orb-queue-layer" aria-hidden={activeTab > 0}>
+            <IconQueue size={21} />
+          </span>
+
+          <span className="orb-player-layer" aria-hidden={activeTab === 0}>
+            <svg className="orb-ring" viewBox="0 0 58 58">
+              <circle cx="29" cy="29" r="27" fill="none" stroke="rgba(255,255,255,0.12)" strokeWidth="2" />
+              <circle
+                cx="29"
+                cy="29"
+                r="27"
+                fill="none"
+                stroke="rgba(255,255,255,0.88)"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeDasharray="169.65"
+                strokeDashoffset={dashOffset}
+                transform="rotate(-90 29 29)"
+              />
+            </svg>
+            <div className={`orb-mini-disc ${isPlaying ? 'playing' : ''}`}>
+              <img src={trackCoverOrFallback(currentTrack)} alt="" />
+              <div className="orb-mini-mask">
+                {isPlaying ? <IconPause size={15} /> : <IconPlay size={15} />}
+              </div>
             </div>
-          </div>
+          </span>
         </button>
       </div>
     </div>

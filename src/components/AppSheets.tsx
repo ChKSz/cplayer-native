@@ -18,6 +18,7 @@ import {
   IconClose,
   IconDownload,
   IconHeart,
+  IconPlus,
   IconRefresh,
   IconSettings,
   IconSwap,
@@ -48,6 +49,8 @@ export function SheetContentRenderer({
       return <PlaylistManageSheetBody />;
     case 'trackAction':
       return <TrackActionSheetBody />;
+    case 'addToPlaylist':
+      return <AddToPlaylistSheetBody />;
     default:
       return null;
   }
@@ -104,6 +107,13 @@ export function useSheetHeaderMeta(): { title: string; subtitle: string } {
       return {
         title: sheetTrackTarget?.name || '歌曲操作',
         subtitle: sheetTrackTarget?.artist || '',
+      };
+    case 'addToPlaylist':
+      return {
+        title: '收藏到云歌单',
+        subtitle: sheetTrackTarget
+          ? `${sheetTrackTarget.name} · ${sheetTrackTarget.artist}`
+          : '选择或新建云歌单',
       };
     default:
       return { title: '', subtitle: '' };
@@ -1053,21 +1063,142 @@ function PlaylistManageSheetBody() {
   );
 }
 
-function TrackActionSheetBody() {
+function AddToPlaylistSheetBody() {
   const track = usePlayerStore((s) => s.sheetTrackTarget);
   const cloudPlaylists = usePlayerStore((s) => s.cloudPlaylists);
+  const cloudTrackPlaylistMap = usePlayerStore((s) => s.cloudTrackPlaylistMap);
+  const addTrackToCloudPlaylist = usePlayerStore((s) => s.addTrackToCloudPlaylist);
+  const removeTrackFromCloudPlaylist = usePlayerStore((s) => s.removeTrackFromCloudPlaylist);
+  const createCloudPlaylistWithTrack = usePlayerStore((s) => s.createCloudPlaylistWithTrack);
+
+  const [newName, setNewName] = useState('');
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+
+  if (!track) return null;
+
+  const belongingIds = cloudTrackPlaylistMap[String(track.id)] || [];
+
+  const onTogglePlaylist = async (playlistId: string, alreadyIn: boolean) => {
+    if (busyId) return;
+    setBusyId(playlistId);
+    try {
+      if (alreadyIn) {
+        await removeTrackFromCloudPlaylist(playlistId, track.id);
+      } else {
+        await addTrackToCloudPlaylist(playlistId, track);
+      }
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const onCreateAndSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newName.trim() || creating) return;
+    setCreating(true);
+    try {
+      await createCloudPlaylistWithTrack(newName, track);
+      setNewName('');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  return (
+    <div className="form-stack" style={{ gap: 14, paddingBottom: 32 }}>
+      <form className="miuix-card form-stack" onSubmit={onCreateAndSave}>
+        <div className="card-label">新建云歌单并存入</div>
+        <div className="inline-create-row">
+          <input
+            className="field"
+            type="text"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="输入新歌单名称..."
+            style={{ flex: 1, minWidth: 0 }}
+          />
+          <button
+            type="submit"
+            className="primary-btn tap"
+            disabled={creating || !newName.trim()}
+            style={{ height: 42, padding: '0 14px', flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 5 }}
+          >
+            <IconPlus size={14} />
+            <span>{creating ? '创建中...' : '新建并存入'}</span>
+          </button>
+        </div>
+      </form>
+
+      <div className="miuix-card form-stack" style={{ gap: 6 }}>
+        <div className="card-label">添加到已有云歌单</div>
+        {cloudPlaylists.length > 0 ? (
+          cloudPlaylists.map((pl) => {
+            const inThis = belongingIds.includes(pl.id);
+            const isBusy = busyId === pl.id;
+            return (
+              <button
+                key={pl.id}
+                type="button"
+                className={`sheet-card tap-soft ${inThis ? 'selected' : ''}`}
+                disabled={Boolean(busyId)}
+                style={{ width: '100%', color: 'var(--ink)', fontSize: 13.5 }}
+                onClick={() => void onTogglePlaylist(pl.id, inThis)}
+              >
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2, minWidth: 0 }}>
+                  <span style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '100%' }}>
+                    {pl.name}
+                  </span>
+                  <span style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>{pl.trackCount} 首</span>
+                </div>
+                <span
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 5,
+                    fontSize: 12,
+                    fontWeight: 600,
+                    color: inThis ? '#fb7185' : 'var(--ink-2)',
+                    flexShrink: 0,
+                  }}
+                >
+                  {isBusy ? (
+                    '处理中...'
+                  ) : inThis ? (
+                    <>
+                      <IconHeart size={15} filled />
+                      <span>已收藏</span>
+                    </>
+                  ) : (
+                    <>
+                      <IconPlus size={14} />
+                      <span>存入</span>
+                    </>
+                  )}
+                </span>
+              </button>
+            );
+          })
+        ) : (
+          <div style={{ fontSize: 12.5, color: 'var(--ink-2)', padding: '8px 4px' }}>
+            暂无云歌单，可在上方直接输入名称新建并存入。
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TrackActionSheetBody() {
+  const track = usePlayerStore((s) => s.sheetTrackTarget);
   const activeCloudPlaylistId = usePlayerStore((s) => s.activeCloudPlaylistId);
-  const favoriteTrackIds = usePlayerStore((s) => s.favoriteTrackIds);
   const playTrackNow = usePlayerStore((s) => s.playTrackNow);
   const playNextInQueue = usePlayerStore((s) => s.playNextInQueue);
-  const toggleFavorite = usePlayerStore((s) => s.toggleFavorite);
   const switchSourceForTrack = usePlayerStore((s) => s.switchSourceForTrack);
-  const addTrackToCloudPlaylist = usePlayerStore((s) => s.addTrackToCloudPlaylist);
   const removeTrackFromActivePlaylist = usePlayerStore((s) => s.removeTrackFromActivePlaylist);
   const closeSheet = usePlayerStore((s) => s.closeSheet);
 
   if (!track) return null;
-  const isFav = favoriteTrackIds.includes(String(track.id));
 
   return (
     <div className="form-stack">
@@ -1096,45 +1227,12 @@ function TrackActionSheetBody() {
       <button
         type="button"
         className="sheet-card tap-soft"
-        style={{ width: '100%', color: isFav ? '#fda4af' : 'var(--ink)', fontSize: 14, fontWeight: 600 }}
-        onClick={() => {
-          void toggleFavorite(track);
-          closeSheet();
-        }}
-      >
-        <span>{isFav ? '从我喜欢的音乐移除' : '收藏到我喜欢的音乐'}</span>
-        <IconHeart size={16} filled={isFav} />
-      </button>
-      <button
-        type="button"
-        className="sheet-card tap-soft"
         style={{ width: '100%', color: 'var(--ink)', fontSize: 14, fontWeight: 600 }}
         onClick={() => switchSourceForTrack(track)}
       >
         <span>换源搜索（跨平台试听）</span>
         <IconSwap size={16} />
       </button>
-
-      {cloudPlaylists.length > 0 && (
-        <div className="info-panel">
-          <div style={{ fontSize: 12, color: 'var(--ink-2)', marginBottom: 4 }}>添加到云歌单</div>
-          {cloudPlaylists.map((pl) => (
-            <button
-              key={pl.id}
-              type="button"
-              className="sheet-card tap-soft"
-              style={{ width: '100%', color: 'var(--ink)', fontSize: 13.5, marginBottom: 4 }}
-              onClick={() => {
-                void addTrackToCloudPlaylist(pl.id, track);
-                closeSheet();
-              }}
-            >
-              <span>{pl.name}</span>
-              <span style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>{pl.trackCount} 首</span>
-            </button>
-          ))}
-        </div>
-      )}
 
       {activeCloudPlaylistId && (
         <button

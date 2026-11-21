@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
 import { findActiveLyricIndex } from '../services/lyrics';
 import { getAdjacentIndices } from '../services/queueOrder';
 import { triggerHaptic } from '../services/transport';
@@ -12,12 +12,12 @@ import {
   IconChevronDown,
   IconClose,
   IconHeart,
+  IconLyrics,
   IconMore,
   IconNext,
   IconPause,
   IconPlay,
   IconPrev,
-  IconQueue,
   IconRepeat,
   IconSettings,
   IconUser,
@@ -32,45 +32,40 @@ function fmtTime(sec: number): string {
 interface LyricRowProps {
   line: LyricLine;
   index: number;
-  activeIndex: number;
-  focusedIndex: number;
-  displayTime: number;
-  isScrubbing: boolean;
+  isActive: boolean;
+  isFocused: boolean;
+  isPast: boolean;
+  depthClass: string;
+  scrubTime: number | null;
   isPlaying: boolean;
   showLyrics: boolean;
-  userBrowsing: boolean;
   showVerbatim: boolean;
   showTranslation: boolean;
   showRomaji: boolean;
-  setRef: (el: HTMLDivElement | null) => void;
+  lineRefs: MutableRefObject<(HTMLDivElement | null)[]>;
 }
 
 /**
  * Renders one lyric line.
- * When `showVerbatim` & `line.words` are enabled on the active line, runs a zero-React-rerender
- * 60fps RAF loop updating `--word-p` and `data-state` directly on syllable spans.
+ * Memoized so regular playback time ticks never re-render unchanged lines or fight
+ * the 60fps verbatim syllable RAF loop (eliminating translation flicker on WebView).
  */
-function LyricRow({
+const LyricRow = memo(function LyricRow({
   line,
   index,
-  activeIndex,
-  focusedIndex,
-  displayTime,
-  isScrubbing,
+  isActive,
+  isPast,
+  depthClass,
+  scrubTime,
   isPlaying,
   showLyrics,
-  userBrowsing,
   showVerbatim,
   showTranslation,
   showRomaji,
-  setRef,
+  lineRefs,
 }: LyricRowProps) {
-  const isActive = index === activeIndex;
-  const isFocused = userBrowsing && index === focusedIndex;
-  const isPast = activeIndex >= 0 && index < activeIndex;
-  const dist = activeIndex >= 0 ? Math.abs(index - activeIndex) : 0;
   const wordRefs = useRef<(HTMLSpanElement | null)[]>([]);
-
+  const isScrubbing = scrubTime !== null;
   const hasWords = Boolean(showVerbatim && line.words && line.words.length > 0);
 
   useEffect(() => {
@@ -83,17 +78,24 @@ function LyricRow({
         if (!span) continue;
         const w = words[i];
         if (!isActive) {
-          span.dataset.state = isPast ? 'past' : 'future';
-          span.style.setProperty('--word-p', isPast ? '100%' : '0%');
+          const nextState = isPast ? 'past' : 'future';
+          if (span.dataset.state !== nextState) {
+            span.dataset.state = nextState;
+            span.style.setProperty('--word-p', isPast ? '100%' : '0%');
+          }
           continue;
         }
         const elapsed = t - w.startTime;
         if (elapsed <= 0) {
-          span.dataset.state = 'future';
-          span.style.setProperty('--word-p', '0%');
+          if (span.dataset.state !== 'future') {
+            span.dataset.state = 'future';
+            span.style.setProperty('--word-p', '0%');
+          }
         } else if (elapsed >= w.duration) {
-          span.dataset.state = 'past';
-          span.style.setProperty('--word-p', '100%');
+          if (span.dataset.state !== 'past') {
+            span.dataset.state = 'past';
+            span.style.setProperty('--word-p', '100%');
+          }
         } else {
           const p = Math.max(0, Math.min(1, elapsed / w.duration));
           span.dataset.state = 'active';
@@ -103,7 +105,8 @@ function LyricRow({
     };
 
     const readPreciseTime = (): number => {
-      if (isScrubbing || !isPlaying) return displayTime;
+      if (scrubTime !== null) return scrubTime;
+      if (!isPlaying) return usePlayerStore.getState().currentTime;
       const engineTime = getPreciseAudioTime();
       return engineTime > 0 ? engineTime : usePlayerStore.getState().currentTime;
     };
@@ -119,20 +122,15 @@ function LyricRow({
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [hasWords, line.words, isActive, isPast, showLyrics, isPlaying, isScrubbing, displayTime]);
-
-  const depthClass = isActive
-    ? 'active'
-    : isFocused
-      ? 'focused'
-      : !userBrowsing && dist >= 3
-        ? 'far'
-        : !userBrowsing && dist === 2
-          ? 'mid'
-          : '';
+  }, [hasWords, line.words, isActive, isPast, showLyrics, isPlaying, isScrubbing, scrubTime]);
 
   return (
-    <div ref={setRef} className={`lyric-line ${depthClass}`}>
+    <div
+      ref={(el) => {
+        lineRefs.current[index] = el;
+      }}
+      className={`lyric-line ${depthClass}`}
+    >
       <div className="lyric-main">
         {hasWords && line.words
           ? line.words.map((w, wi) => (
@@ -142,7 +140,6 @@ function LyricRow({
                   wordRefs.current[wi] = el;
                 }}
                 className="yrc-word"
-                data-state={isPast ? 'past' : 'future'}
               >
                 {w.text}
               </span>
@@ -153,7 +150,7 @@ function LyricRow({
       {showTranslation && line.translation && <span className="tlrc">{line.translation}</span>}
     </div>
   );
-}
+});
 
 /** Minimalist white NetEase-style tonearm SVG proportionally anchored to --vinyl-size. */
 function VinylTonearm({ engaged }: { engaged: boolean }) {
@@ -206,7 +203,7 @@ export function PlayerPage() {
   const showRomaji = usePlayerStore((s) => s.showRomaji);
   const lyricFontSize = usePlayerStore((s) => s.lyricFontSize);
   const sleepTimerMode = usePlayerStore((s) => s.sleepTimerMode);
-  const favoriteTrackIds = usePlayerStore((s) => s.favoriteTrackIds);
+  const savedCloudTrackIds = usePlayerStore((s) => s.savedCloudTrackIds);
   const failedTrackOffer = usePlayerStore((s) => s.failedTrackOffer);
 
   const setShowLyrics = usePlayerStore((s) => s.setShowLyrics);
@@ -216,7 +213,7 @@ export function PlayerPage() {
   const seekTo = usePlayerStore((s) => s.seekTo);
   const cyclePlayMode = usePlayerStore((s) => s.cyclePlayMode);
   const openSheet = usePlayerStore((s) => s.openSheet);
-  const toggleFavorite = usePlayerStore((s) => s.toggleFavorite);
+  const showToast = usePlayerStore((s) => s.showToast);
   const dismissFailedOffer = usePlayerStore((s) => s.dismissFailedOffer);
   const switchSourceForTrack = usePlayerStore((s) => s.switchSourceForTrack);
 
@@ -233,11 +230,19 @@ export function PlayerPage() {
   const progressRef = useRef<HTMLDivElement | null>(null);
 
   const lyricsDownRef = useRef<{ x: number; y: number } | null>(null);
+  const touchStartRef = useRef<{ x: number; y: number; scrolled: boolean } | null>(null);
+  const userBrowsingRef = useRef(false);
   const programmaticScrollRef = useRef(false);
+  const lastProgrammaticTopRef = useRef(0);
   const scrollAnimRafRef = useRef<number | null>(null);
   const progScrollClearRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const userIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const touchingLyricsRef = useRef(false);
+
+  const setBrowsingState = useCallback((val: boolean) => {
+    userBrowsingRef.current = val;
+    setUserBrowsing(val);
+  }, []);
 
   const displayTime = scrubTime !== null ? scrubTime : currentTime;
   const ratio = duration > 0 ? Math.max(0, Math.min(1, displayTime / duration)) : 0;
@@ -298,9 +303,10 @@ export function PlayerPage() {
 
       if (durationMs <= 0 || Math.abs(target - box.scrollTop) < 1) {
         box.scrollTop = target;
+        lastProgrammaticTopRef.current = target;
         progScrollClearRef.current = setTimeout(() => {
           programmaticScrollRef.current = false;
-        }, 60);
+        }, 80);
         return;
       }
 
@@ -309,14 +315,16 @@ export function PlayerPage() {
       const step = (now: number) => {
         const t = Math.min(1, (now - startTime) / durationMs);
         const eased = 1 - Math.pow(1 - t, 3);
-        box.scrollTop = startTop + (target - startTop) * eased;
+        const nextTop = startTop + (target - startTop) * eased;
+        box.scrollTop = nextTop;
+        lastProgrammaticTopRef.current = nextTop;
         if (t < 1) {
           scrollAnimRafRef.current = requestAnimationFrame(step);
         } else {
           scrollAnimRafRef.current = null;
           progScrollClearRef.current = setTimeout(() => {
             programmaticScrollRef.current = false;
-          }, 60);
+          }, 80);
         }
       };
       scrollAnimRafRef.current = requestAnimationFrame(step);
@@ -343,26 +351,28 @@ export function PlayerPage() {
   useEffect(() => {
     if (stageRef.current) stageRef.current.scrollLeft = 0;
     if (showLyrics) {
-      setUserBrowsing(false);
+      setBrowsingState(false);
       if (userIdleTimerRef.current) clearTimeout(userIdleTimerRef.current);
       const t = setTimeout(() => scrollToActiveRef.current(0), 60);
       return () => clearTimeout(t);
     }
+    setBrowsingState(false);
     return undefined;
-  }, [showLyrics]);
+  }, [showLyrics, setBrowsingState]);
 
   useEffect(() => {
     cancelScrollAnim();
-    setUserBrowsing(false);
+    setBrowsingState(false);
     if (userIdleTimerRef.current) clearTimeout(userIdleTimerRef.current);
     if (lyricsBoxRef.current) {
       programmaticScrollRef.current = true;
       lyricsBoxRef.current.scrollTop = 0;
+      lastProgrammaticTopRef.current = 0;
       progScrollClearRef.current = setTimeout(() => {
         programmaticScrollRef.current = false;
-      }, 60);
+      }, 80);
     }
-  }, [currentTrack?.id, cancelScrollAnim]);
+  }, [currentTrack?.id, cancelScrollAnim, setBrowsingState]);
 
   useEffect(() => {
     if (!showLyrics || userBrowsing || activeLyricIdx < 0) return;
@@ -395,20 +405,34 @@ export function PlayerPage() {
     return bestIdx;
   };
 
-  const scheduleAutoResume = () => {
-    cancelScrollAnim();
-    setUserBrowsing(true);
-    setFocusedLineIdx(computeCenterLineIndex());
+  const armAutoResumeTimer = () => {
     if (userIdleTimerRef.current) clearTimeout(userIdleTimerRef.current);
     userIdleTimerRef.current = setTimeout(() => {
       if (touchingLyricsRef.current) return;
-      setUserBrowsing(false);
+      setBrowsingState(false);
     }, 2000);
+  };
+
+  const enterUserBrowsing = () => {
+    cancelScrollAnim();
+    setBrowsingState(true);
+    setFocusedLineIdx(computeCenterLineIndex());
+    armAutoResumeTimer();
   };
 
   const handleLyricsUserScroll = () => {
     if (programmaticScrollRef.current) return;
-    scheduleAutoResume();
+    const box = lyricsBoxRef.current;
+    if (!box) return;
+    // Ignore tiny passive layout drift when user has not actively dragged/scrolled
+    if (
+      !userBrowsingRef.current &&
+      !touchStartRef.current?.scrolled &&
+      Math.abs(box.scrollTop - lastProgrammaticTopRef.current) < 6
+    ) {
+      return;
+    }
+    enterUserBrowsing();
   };
 
   // ================= 3-Disc Horizontal Drag-to-Skip + Tap-to-Flip =================
@@ -557,7 +581,7 @@ export function PlayerPage() {
   const armEngaged = isPlaying && !draggingDisc && !showLyrics;
   const focusedLine = lyrics[focusedLineIdx];
   const isFavorite = Boolean(
-    currentTrack && favoriteTrackIds.includes(String(currentTrack.id)),
+    currentTrack && savedCloudTrackIds.includes(String(currentTrack.id)),
   );
 
   return (
@@ -676,53 +700,87 @@ export function PlayerPage() {
               className={`lyrics-box lyric-size-${lyricFontSize}`}
               data-testid="lyrics-box"
               onScroll={handleLyricsUserScroll}
-              onWheel={() => scheduleAutoResume()}
-              onTouchStart={() => {
+              onWheel={() => enterUserBrowsing()}
+              onTouchStart={(e) => {
                 touchingLyricsRef.current = true;
-                scheduleAutoResume();
+                const t = e.touches[0];
+                touchStartRef.current = t
+                  ? { x: t.clientX, y: t.clientY, scrolled: false }
+                  : null;
               }}
-              onTouchMove={() => {
+              onTouchMove={(e) => {
                 touchingLyricsRef.current = true;
-                scheduleAutoResume();
+                const t = e.touches[0];
+                const start = touchStartRef.current;
+                if (t && start) {
+                  if (!start.scrolled && Math.abs(t.clientY - start.y) > 8) {
+                    start.scrolled = true;
+                    enterUserBrowsing();
+                  } else if (start.scrolled) {
+                    enterUserBrowsing();
+                  }
+                }
               }}
               onTouchEnd={() => {
                 touchingLyricsRef.current = false;
-                scheduleAutoResume();
+                if (userBrowsingRef.current) {
+                  armAutoResumeTimer();
+                }
               }}
               onTouchCancel={() => {
                 touchingLyricsRef.current = false;
-                scheduleAutoResume();
+                if (userBrowsingRef.current) {
+                  armAutoResumeTimer();
+                }
               }}
               onPointerDown={(e) => {
                 lyricsDownRef.current = { x: e.clientX, y: e.clientY };
               }}
               onClick={(e) => {
                 const d = lyricsDownRef.current;
+                const dragged = Boolean(touchStartRef.current?.scrolled);
+                touchStartRef.current = null;
+                if (dragged) return;
                 if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 10) return;
+                if (userIdleTimerRef.current) clearTimeout(userIdleTimerRef.current);
+                setBrowsingState(false);
                 flipStage(e.clientX);
               }}
             >
               {lyrics.length > 0 ? (
-                lyrics.map((line, idx) => (
-                  <LyricRow
-                    key={`${line.time}-${idx}`}
-                    line={line}
-                    index={idx}
-                    activeIndex={activeLyricIdx}
-                    focusedIndex={focusedLineIdx}
-                    displayTime={displayTime}
-                    isScrubbing={scrubTime !== null}
-                    isPlaying={isPlaying}
-                    showLyrics={showLyrics}
-                    userBrowsing={userBrowsing}
-                    showVerbatim={showVerbatim}
-                    showTranslation={showTranslation}
-                    showRomaji={showRomaji}
-                    setRef={(el) => {
-                      lineRefs.current[idx] = el;
-                    }}
-                  />
-                ))
+                lyrics.map((line, idx) => {
+                  const isActive = idx === activeLyricIdx;
+                  const isFocused = userBrowsing && idx === focusedLineIdx;
+                  const isPast = activeLyricIdx >= 0 && idx < activeLyricIdx;
+                  const dist = activeLyricIdx >= 0 ? Math.abs(idx - activeLyricIdx) : 0;
+                  const depthClass = isActive
+                    ? 'active'
+                    : isFocused
+                      ? 'focused'
+                      : !userBrowsing && dist >= 3
+                        ? 'far'
+                        : !userBrowsing && dist === 2
+                          ? 'mid'
+                          : '';
+                  return (
+                    <LyricRow
+                      key={`${line.time}-${idx}`}
+                      line={line}
+                      index={idx}
+                      isActive={isActive}
+                      isFocused={isFocused}
+                      isPast={isPast}
+                      depthClass={depthClass}
+                      scrubTime={scrubTime}
+                      isPlaying={isPlaying}
+                      showLyrics={showLyrics}
+                      showVerbatim={showVerbatim}
+                      showTranslation={showTranslation}
+                      showRomaji={showRomaji}
+                      lineRefs={lineRefs}
+                    />
+                  );
+                })
               ) : (
                 <div className="empty-box">
                   <span>{currentTrack ? '纯音乐，请欣赏' : '尚未开始播放'}</span>
@@ -759,7 +817,7 @@ export function PlayerPage() {
                   onClick={(e) => {
                     e.stopPropagation();
                     if (userIdleTimerRef.current) clearTimeout(userIdleTimerRef.current);
-                    setUserBrowsing(false);
+                    setBrowsingState(false);
                     seekTo(focusedLine.time);
                     if (!isPlaying) void togglePlay();
                     void triggerHaptic('light');
@@ -790,11 +848,16 @@ export function PlayerPage() {
             <button
               type="button"
               className={`icon-btn ghost tap heart-btn ${isFavorite ? 'active' : ''}`}
-              aria-label={isFavorite ? '取消喜欢' : '收藏到我喜欢的音乐'}
+              aria-label={isFavorite ? '管理云歌单收藏' : '收藏到云歌单'}
               data-testid="favorite-btn"
               onClick={() => {
                 void triggerHaptic('selection');
-                void toggleFavorite(currentTrack);
+                if (!user) {
+                  showToast('请先登录 CPlayerSync 以收藏到云歌单');
+                  openSheet('account');
+                  return;
+                }
+                openSheet('addToPlaylist', currentTrack);
               }}
             >
               <IconHeart size={18} filled={isFavorite} />
@@ -934,15 +997,12 @@ export function PlayerPage() {
 
         <button
           type="button"
-          className="ctrl-btn muted tap"
-          aria-label="播放队列"
-          data-testid="queue-btn"
-          onClick={() => {
-            void triggerHaptic('light');
-            openSheet('queue');
-          }}
+          className={`ctrl-btn ${showLyrics ? '' : 'muted'} tap`}
+          aria-label={showLyrics ? '切回黑胶唱片' : '查看歌词'}
+          data-testid="lyrics-toggle-btn"
+          onClick={() => flipStage()}
         >
-          <IconQueue size={21} />
+          <IconLyrics size={20} />
         </button>
       </div>
     </section>

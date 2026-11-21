@@ -69,4 +69,12 @@ describe('Lyrics parser & time synchronization', () => {
     expect(fallback[0].translation).toBe('行级译文');
     expect(fallback[0].romaji).toBe('hang ji');
   });
+
+  it('skips NetEase // translation placeholders and maps each translation to its closest lyric line', () => {
+    const lrc = '[00:10.00]First line\n[00:10.50]Second line';
+    const tlrc = '[00:10.00]//\n[00:10.48]第二句翻译';
+    const parsed = parseLyrics(lrc, tlrc);
+    expect(parsed[0].translation).toBeNull();
+    expect(parsed[1].translation).toBe('第二句翻译');
+  });
 });

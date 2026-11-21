@@ -88,20 +88,53 @@ export function parseYrc(text: string): LyricLine[] {
   return result.sort((a, b) => a.time - b.time);
 }
 
-function findMatchingAuxLine(aux: RawLyricLine[], time: number): string | null {
-  if (!aux.length) return null;
-  let best: RawLyricLine | null = null;
-  let bestDiff = 0.65;
-  for (const item of aux) {
-    const diff = Math.abs(item.time - time);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = item;
+function assignAuxLines(originTimes: number[], aux: RawLyricLine[]): (string | null)[] {
+  const assigned: (string | null)[] = new Array(originTimes.length).fill(null);
+  if (!originTimes.length || !aux.length) return assigned;
+
+  const cleanAux = aux.filter((item) => {
+    const t = item.text.trim();
+    return Boolean(t) && t !== '//';
+  });
+  if (!cleanAux.length) return assigned;
+
+  const bestDiffForOrigin = new Array<number>(originTimes.length).fill(Infinity);
+  const assignedAuxIdx = new Array<number>(originTimes.length).fill(-1);
+
+  // Assign each translation/romaji line to its single closest lyric line within 0.65s
+  for (let ai = 0; ai < cleanAux.length; ai++) {
+    const item = cleanAux[ai];
+    let bestOriginIdx = -1;
+    let bestDiff = 0.65;
+    for (let i = 0; i < originTimes.length; i++) {
+      const diff = Math.abs(originTimes[i] - item.time);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestOriginIdx = i;
+      }
+    }
+    if (bestOriginIdx >= 0 && bestDiff < bestDiffForOrigin[bestOriginIdx]) {
+      bestDiffForOrigin[bestOriginIdx] = bestDiff;
+      assigned[bestOriginIdx] = item.text;
+      assignedAuxIdx[bestOriginIdx] = ai;
     }
   }
-  if (best) return best.text;
-  const rounded = aux.find((t) => Math.round(t.time) === Math.round(time));
-  return rounded ? rounded.text : null;
+
+  const usedAux = new Set(assignedAuxIdx.filter((idx) => idx >= 0));
+
+  // Gentle fallback for rounded-second timestamps on still-unmatched lines using only unassigned aux entries
+  for (let i = 0; i < originTimes.length; i++) {
+    if (assigned[i] !== null) continue;
+    const roundedIdx = cleanAux.findIndex(
+      (t, ai) => !usedAux.has(ai) && Math.round(t.time) === Math.round(originTimes[i]),
+    );
+    if (roundedIdx >= 0) {
+      usedAux.add(roundedIdx);
+      assigned[i] = cleanAux[roundedIdx].text;
+    }
+  }
+
+  return assigned;
 }
 
 /**
@@ -132,19 +165,25 @@ export function parseLyrics(
   const romaLines = parseLrc(romaSource);
 
   if (useYrc) {
-    return yrcLines.map((line) => ({
+    const times = yrcLines.map((l) => l.time);
+    const transAssigned = assignAuxLines(times, transLines);
+    const romaAssigned = assignAuxLines(times, romaLines);
+    return yrcLines.map((line, i) => ({
       ...line,
-      translation: findMatchingAuxLine(transLines, line.time),
-      romaji: findMatchingAuxLine(romaLines, line.time),
+      translation: transAssigned[i],
+      romaji: romaAssigned[i],
     }));
   }
 
   const origin = parseLrc(payload.lrc || '');
-  return origin.map((item) => ({
+  const times = origin.map((l) => l.time);
+  const transAssigned = assignAuxLines(times, transLines);
+  const romaAssigned = assignAuxLines(times, romaLines);
+  return origin.map((item, i) => ({
     time: item.time,
     text: item.text,
-    translation: findMatchingAuxLine(transLines, item.time),
-    romaji: findMatchingAuxLine(romaLines, item.time),
+    translation: transAssigned[i],
+    romaji: romaAssigned[i],
   }));
 }
 

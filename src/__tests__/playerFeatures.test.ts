@@ -286,4 +286,34 @@ describe('Player store v1.1 native preloading, sleep timer, queue, auto-skip & s
     expect(st.searchQuery).toBe('晴天 周杰伦');
     expect(st.activeSheet).toBeNull();
   });
+
+  it('immediately preloads the next track right after playback starts and marks cloud-playlist tracks as saved', async () => {
+    vi.useFakeTimers();
+    const h = await setupHarness();
+    vi.spyOn(h.musicService, 'getSong').mockImplementation(async (id) => ({
+      id,
+      url: `https://cdn.example.com/audio/${id}.mp3`,
+      name: `Song ${id}`,
+      artist: 'Artist',
+      cover: '',
+      source: 'ChKSz',
+      requestedLevel: 'lossless',
+      level: 'lossless',
+      br: 320000,
+    }));
+
+    const tracks = makeTracks(2);
+    await h.usePlayerStore
+      .getState()
+      .playTrackList(tracks, 0, { kind: 'cloud', playlistId: 'pl-custom-1' });
+
+    // Playing from ANY cloud playlist immediately lights up the saved cloud track set
+    expect(h.usePlayerStore.getState().savedCloudTrackIds).toContain('1000');
+    expect(h.usePlayerStore.getState().cloudTrackPlaylistMap['1000']).toContain('pl-custom-1');
+
+    // Immediate next-track pre-resolution fires within 150ms of starting track 1
+    await vi.advanceTimersByTimeAsync(150);
+    expect(h.nextCalls.length).toBe(1);
+    expect(h.nextCalls[0].trackId).toBe('1001');
+  });
 });
