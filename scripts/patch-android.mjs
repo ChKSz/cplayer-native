@@ -2,6 +2,8 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const androidRoot = join(process.cwd(), 'src-tauri', 'gen', 'android');
+const buildSrcDir = join(androidRoot, 'buildSrc');
+const buildSrcSettingsPath = join(buildSrcDir, 'settings.gradle.kts');
 const gradlePath = join(androidRoot, 'app', 'build.gradle.kts');
 const proguardPath = join(androidRoot, 'app', 'proguard-cplayer.pro');
 const manifestPath = join(androidRoot, 'app', 'src', 'main', 'AndroidManifest.xml');
@@ -21,6 +23,22 @@ const servicePath = join(pkgDir, 'CPlayerPlaybackService.kt');
 if (!existsSync(androidRoot)) {
   console.error('[patch-android] src-tauri/gen/android not found. Run `npx tauri android init` first.');
   process.exit(1);
+}
+
+// 0. Ensure buildSrc has its own settings.gradle.kts so Gradle 9 resolves Kotlin DSL deps via Maven Central
+if (existsSync(buildSrcDir)) {
+  const buildSrcSettings = `pluginManagement {
+    repositories {
+        mavenCentral()
+        gradlePluginPortal()
+        google()
+    }
+}
+
+rootProject.name = "buildSrc"
+`;
+  writeFileSync(buildSrcSettingsPath, buildSrcSettings, 'utf8');
+  console.log('[patch-android] Wrote buildSrc/settings.gradle.kts');
 }
 
 // 1. Patch app/build.gradle.kts with AndroidX Media3 dependencies & APK size optimizations
@@ -101,6 +119,9 @@ const proguardRules = `# Keep CPlayer WebView @JavascriptInterface bridges under
 }
 -keep class top.chksz.cplayer.MainActivity { *; }
 -keep class top.chksz.cplayer.CPlayerPlaybackService { *; }
+-dontwarn java.beans.**
+-dontwarn javax.xml.**
+-dontwarn org.w3c.dom.bootstrap.**
 `;
 if (existsSync(join(androidRoot, 'app'))) {
   writeFileSync(proguardPath, proguardRules, 'utf8');
@@ -519,9 +540,13 @@ class MainActivity : TauriActivity() {
           }
         }
 
+        val headersObj = JSONObject()
+        for ((k, v) in respHeaders) {
+          headersObj.put(k, v)
+        }
         val payloadJson = JSONObject().apply {
           put("status", status)
-          put("headers", JSONObject(respHeaders as Map<*, *>))
+          put("headers", headersObj)
           put("body", bodyText)
         }.toString()
 
