@@ -3,7 +3,9 @@ import { join } from 'node:path';
 
 const androidRoot = join(process.cwd(), 'src-tauri', 'gen', 'android');
 const resValuesDir = join(androidRoot, 'app', 'src', 'main', 'res', 'values');
+const resXmlDir = join(androidRoot, 'app', 'src', 'main', 'res', 'xml');
 const launcherBgXmlPath = join(resValuesDir, 'ic_launcher_background.xml');
+const updatePathsXmlPath = join(resXmlDir, 'cplayer_update_paths.xml');
 const buildSrcDir = join(androidRoot, 'buildSrc');
 const buildSrcSettingsPath = join(buildSrcDir, 'settings.gradle.kts');
 const buildSrcGradlePath = join(buildSrcDir, 'build.gradle.kts');
@@ -39,6 +41,16 @@ const launcherBgXml = `<?xml version="1.0" encoding="utf-8"?>
 `;
 writeFileSync(launcherBgXmlPath, launcherBgXml, 'utf8');
 console.log('[patch-android] Ensured res/values/ic_launcher_background.xml (#66BB6A)');
+
+// 0b. Write dedicated FileProvider path config for in-app APK updates
+mkdirSync(resXmlDir, { recursive: true });
+const updatePathsXml = `<?xml version="1.0" encoding="utf-8"?>
+<paths>
+  <cache-path name="cplayer_updates" path="updates/" />
+</paths>
+`;
+writeFileSync(updatePathsXmlPath, updatePathsXml, 'utf8');
+console.log('[patch-android] Wrote res/xml/cplayer_update_paths.xml');
 
 // 0. Ensure buildSrc and root Gradle resolve Maven Central via Google's GCS mirror first
 // (avoids Maven Central / Cloudflare edge 404/rate-limit issues on GitHub Actions runners)
@@ -165,6 +177,7 @@ const proguardRules = `# Keep CPlayer WebView @JavascriptInterface bridges under
 }
 -keep class top.chksz.cplayer.MainActivity { *; }
 -keep class top.chksz.cplayer.CPlayerPlaybackService { *; }
+-keep class top.chksz.cplayer.CPlayerUpdateFileProvider { *; }
 -dontwarn java.beans.**
 -dontwarn javax.xml.**
 -dontwarn org.w3c.dom.bootstrap.**
@@ -184,6 +197,7 @@ if (existsSync(manifestPath)) {
     'android.permission.FOREGROUND_SERVICE',
     'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK',
     'android.permission.POST_NOTIFICATIONS',
+    'android.permission.REQUEST_INSTALL_PACKAGES',
   ];
 
   for (const perm of requiredPerms) {
@@ -207,6 +221,21 @@ if (existsSync(manifestPath)) {
         </service>
 `;
     manifest = manifest.replace('</application>', `${serviceXml}    </application>`);
+  }
+
+  if (!manifest.includes('CPlayerUpdateFileProvider')) {
+    const providerXml = `
+        <provider
+            android:name=".CPlayerUpdateFileProvider"
+            android:authorities="\${applicationId}.updateprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/cplayer_update_paths" />
+        </provider>
+`;
+    manifest = manifest.replace('</application>', `${providerXml}    </application>`);
   }
 
   writeFileSync(manifestPath, manifest, 'utf8');
@@ -649,11 +678,14 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.provider.Settings
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.MediaItem
@@ -666,6 +698,8 @@ import com.google.common.util.concurrent.ListenableFuture
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -676,6 +710,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.zip.GZIPInputStream
 import java.util.zip.InflaterInputStream
+
+class CPlayerUpdateFileProvider : FileProvider()
 
 class MainActivity : TauriActivity() {
   private class ActiveHttpCall {
@@ -696,6 +732,13 @@ class MainActivity : TauriActivity() {
   private var pendingAction: ((MediaController) -> Unit)? = null
   private val httpExecutor: ExecutorService = Executors.newCachedThreadPool()
   private val activeHttpCalls = ConcurrentHashMap<String, ActiveHttpCall>()
+  private val updateExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+  @Volatile
+  private var activeUpdateCall: ActiveHttpCall? = null
+
+  @Volatile
+  private var downloadedApkFile: File? = null
 
   private val progressTicker = object : Runnable {
     override fun run() {
@@ -1167,6 +1210,164 @@ class MainActivity : TauriActivity() {
     }
 
     @JavascriptInterface
+    fun downloadAndInstallApk(url: String, version: String): Boolean {
+      val parsed = try {
+        Uri.parse(url)
+      } catch (_: Exception) {
+        return false
+      }
+      if (!parsed.scheme.equals("https", ignoreCase = true)) return false
+
+      cancelActiveUpdateDownload(emitCancelEvent = false)
+
+      val call = ActiveHttpCall()
+      activeUpdateCall = call
+      val safeVer = version.replace(Regex("[^0-9A-Za-z._-]"), "_").ifBlank { "latest" }
+      emitUpdateEvent("downloading", 0L, -1L, null)
+
+      call.future = updateExecutor.submit {
+        var conn: HttpURLConnection? = null
+        var partFile: File? = null
+        try {
+          val updatesDir = File(cacheDir, "updates")
+          if (!updatesDir.exists()) updatesDir.mkdirs()
+          updatesDir.listFiles()?.forEach { old ->
+            try {
+              old.delete()
+            } catch (_: Exception) {
+            }
+          }
+
+          val finalFile = File(updatesDir, "cplayer-$safeVer.apk")
+          partFile = File(updatesDir, "cplayer-$safeVer.apk.part")
+
+          var currentUrl = url
+          var hops = 0
+          var statusCode = -1
+          while (hops < 8) {
+            if (call.cancelled || Thread.currentThread().isInterrupted) {
+              emitUpdateEvent("cancelled")
+              return@submit
+            }
+            val nextConn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+              requestMethod = "GET"
+              instanceFollowRedirects = false
+              connectTimeout = 20_000
+              readTimeout = 45_000
+              setRequestProperty("User-Agent", "CPlayer-Native/1.1.1 (Android)")
+              setRequestProperty("Accept", "application/vnd.android.package-archive, application/octet-stream, */*")
+            }
+            conn = nextConn
+            call.connection = nextConn
+            statusCode = nextConn.responseCode
+
+            if (statusCode in listOf(301, 302, 303, 307, 308)) {
+              val location = nextConn.getHeaderField("Location")
+              nextConn.disconnect()
+              if (location.isNullOrBlank()) break
+              val resolved = URL(URL(currentUrl), location)
+              if (!resolved.protocol.equals("https", ignoreCase = true)) {
+                throw IllegalStateException("拒绝非 HTTPS 下载重定向")
+              }
+              currentUrl = resolved.toString()
+              hops++
+              continue
+            }
+            break
+          }
+
+          val activeConn = conn ?: throw IllegalStateException("无法连接下载服务器")
+          if (statusCode !in 200..299) {
+            throw IllegalStateException("下载失败（HTTP $statusCode）")
+          }
+
+          val totalBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            activeConn.contentLengthLong
+          } else {
+            activeConn.contentLength.toLong()
+          }
+
+          var downloadedBytes = 0L
+          var lastEmitAt = 0L
+          val buf = ByteArray(32 * 1024)
+          BufferedInputStream(activeConn.inputStream).use { input ->
+            FileOutputStream(partFile).use { output ->
+              while (true) {
+                if (call.cancelled || Thread.currentThread().isInterrupted) {
+                  emitUpdateEvent("cancelled")
+                  return@submit
+                }
+                val read = input.read(buf)
+                if (read < 0) break
+                output.write(buf, 0, read)
+                downloadedBytes += read
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastEmitAt >= 120L) {
+                  lastEmitAt = now
+                  emitUpdateEvent("downloading", downloadedBytes, totalBytes, null)
+                }
+              }
+              output.flush()
+            }
+          }
+
+          if (call.cancelled) {
+            emitUpdateEvent("cancelled")
+            return@submit
+          }
+          if (downloadedBytes < 100_000L) {
+            throw IllegalStateException("安装包体积异常，请改用浏览器下载")
+          }
+          if (finalFile.exists()) finalFile.delete()
+          if (!partFile.renameTo(finalFile)) {
+            partFile.copyTo(finalFile, overwrite = true)
+            partFile.delete()
+          }
+
+          downloadedApkFile = finalFile
+          emitUpdateEvent("ready", downloadedBytes, if (totalBytes > 0) totalBytes else downloadedBytes, null)
+          mainHandler.post {
+            launchApkInstaller(finalFile)
+          }
+        } catch (err: Exception) {
+          try {
+            partFile?.delete()
+          } catch (_: Exception) {
+          }
+          if (call.cancelled || Thread.currentThread().isInterrupted) {
+            emitUpdateEvent("cancelled")
+          } else {
+            emitUpdateEvent("error", 0L, -1L, err.localizedMessage ?: "安装包下载失败")
+          }
+        } finally {
+          if (activeUpdateCall === call) {
+            activeUpdateCall = null
+          }
+          try {
+            conn?.disconnect()
+          } catch (_: Exception) {
+          }
+        }
+      }
+      return true
+    }
+
+    @JavascriptInterface
+    fun cancelApkDownload(): Boolean {
+      return cancelActiveUpdateDownload(emitCancelEvent = true)
+    }
+
+    @JavascriptInterface
+    fun installDownloadedApk(): Boolean {
+      val file = downloadedApkFile ?: return false
+      if (!file.exists() || file.length() < 100_000L) return false
+      mainHandler.post {
+        launchApkInstaller(file)
+      }
+      return true
+    }
+
+    @JavascriptInterface
     fun play() {
       withController { it.play() }
     }
@@ -1187,6 +1388,81 @@ class MainActivity : TauriActivity() {
         it.stop()
         it.clearMediaItems()
       }
+    }
+  }
+
+  private fun emitUpdateEvent(
+    status: String,
+    downloaded: Long = 0L,
+    total: Long = -1L,
+    message: String? = null,
+  ) {
+    val pct = if (total > 0L) {
+      ((downloaded.toDouble() / total.toDouble()) * 100.0).toInt().coerceIn(0, 100)
+    } else if (status == "ready" || status == "installing") {
+      100
+    } else {
+      0
+    }
+    val payload = JSONObject().apply {
+      put("status", status)
+      put("downloadedBytes", downloaded)
+      put("totalBytes", total)
+      put("percent", pct)
+      if (!message.isNullOrBlank()) put("message", message)
+    }
+    wakeAndEmitJs("window.__cplayerUpdateBridge?.onEvent?.(\${jsStringLiteral(payload.toString())})")
+  }
+
+  private fun cancelActiveUpdateDownload(emitCancelEvent: Boolean): Boolean {
+    val call = activeUpdateCall ?: return false
+    call.cancelled = true
+    activeUpdateCall = null
+    call.future?.cancel(true)
+    try {
+      call.connection?.disconnect()
+    } catch (_: Exception) {
+    }
+    if (emitCancelEvent) {
+      emitUpdateEvent("cancelled")
+    }
+    return true
+  }
+
+  private fun launchApkInstaller(apkFile: File): Boolean {
+    return try {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+        emitUpdateEvent(
+          "permission_required",
+          apkFile.length(),
+          apkFile.length(),
+          "请在系统设置中允许 CPlayer 安装未知应用，返回后点击「立即安装」",
+        )
+        val settingsIntent = Intent(
+          Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+          Uri.parse("package:$packageName"),
+        ).apply {
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(settingsIntent)
+        return true
+      }
+
+      val contentUri = FileProvider.getUriForFile(
+        this,
+        "$packageName.updateprovider",
+        apkFile,
+      )
+      val installIntent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(contentUri, "application/vnd.android.package-archive")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+      }
+      startActivity(installIntent)
+      emitUpdateEvent("installing", apkFile.length(), apkFile.length(), null)
+      true
+    } catch (err: Exception) {
+      emitUpdateEvent("error", 0L, -1L, err.localizedMessage ?: "无法拉起系统安装器")
+      false
     }
   }
 
@@ -1316,6 +1592,8 @@ class MainActivity : TauriActivity() {
     }
     activeHttpCalls.clear()
     httpExecutor.shutdownNow()
+    cancelActiveUpdateDownload(emitCancelEvent = false)
+    updateExecutor.shutdownNow()
     super.onDestroy()
   }
 }

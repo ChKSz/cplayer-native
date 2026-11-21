@@ -1,8 +1,91 @@
+import {
+  getNativeMediaApi,
+  type NativeUpdateEventPayload,
+} from '../engine/nativeMediaBridge';
 import { nativeFetch } from './transport';
 
-export const APP_VERSION = '1.1.0';
+export const APP_VERSION = '1.1.1';
 export const GITHUB_RELEASES_API = 'https://api.github.com/repos/ChKSz/cplayer-native/releases/latest';
 export const GITHUB_RELEASES_PAGE = 'https://github.com/ChKSz/cplayer-native/releases';
+
+const DISMISSED_UPDATE_KEY = 'cp_dismissed_update_ver';
+
+export function getDismissedUpdateVersion(): string | null {
+  try {
+    return typeof localStorage !== 'undefined' ? localStorage.getItem(DISMISSED_UPDATE_KEY) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setDismissedUpdateVersion(version: string): void {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(DISMISSED_UPDATE_KEY, version.trim());
+    }
+  } catch {
+    // Ignore storage error
+  }
+}
+
+export function isNativeApkUpdateSupported(): boolean {
+  const api = getNativeMediaApi();
+  return Boolean(api && typeof api.downloadAndInstallApk === 'function');
+}
+
+export function startNativeApkDownload(url: string, version: string): boolean {
+  const api = getNativeMediaApi();
+  if (!api?.downloadAndInstallApk) return false;
+  try {
+    return Boolean(api.downloadAndInstallApk(url, version));
+  } catch {
+    return false;
+  }
+}
+
+export function cancelNativeApkDownload(): boolean {
+  const api = getNativeMediaApi();
+  if (!api?.cancelApkDownload) return false;
+  try {
+    return Boolean(api.cancelApkDownload());
+  } catch {
+    return false;
+  }
+}
+
+export function triggerNativeApkInstall(): boolean {
+  const api = getNativeMediaApi();
+  if (!api?.installDownloadedApk) return false;
+  try {
+    return Boolean(api.installDownloadedApk());
+  } catch {
+    return false;
+  }
+}
+
+export function registerNativeUpdateListener(
+  listener: (event: NativeUpdateEventPayload) => void,
+): () => void {
+  if (typeof window === 'undefined') return () => {};
+  const bridge = {
+    onEvent: (payloadJson: string) => {
+      try {
+        const parsed = JSON.parse(payloadJson) as NativeUpdateEventPayload;
+        if (parsed && typeof parsed.status === 'string') {
+          listener(parsed);
+        }
+      } catch {
+        // Ignore malformed bridge event
+      }
+    },
+  };
+  window.__cplayerUpdateBridge = bridge;
+  return () => {
+    if (window.__cplayerUpdateBridge === bridge) {
+      delete window.__cplayerUpdateBridge;
+    }
+  };
+}
 
 export interface AppUpdateCheckResult {
   hasUpdate: boolean;

@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   APP_VERSION,
-  checkForAppUpdate,
-  type AppUpdateCheckResult,
+  isNativeApkUpdateSupported,
 } from '../services/appUpdater';
 import {
   cpSync,
@@ -51,6 +50,8 @@ export function SheetContentRenderer({
       return <TrackActionSheetBody />;
     case 'addToPlaylist':
       return <AddToPlaylistSheetBody />;
+    case 'appUpdate':
+      return <AppUpdateSheetBody />;
     default:
       return null;
   }
@@ -114,6 +115,11 @@ export function useSheetHeaderMeta(): { title: string; subtitle: string } {
         subtitle: sheetTrackTarget
           ? `${sheetTrackTarget.name} · ${sheetTrackTarget.artist}`
           : '选择或新建云歌单',
+      };
+    case 'appUpdate':
+      return {
+        title: '发现新版本',
+        subtitle: `当前 v${APP_VERSION} · 支持应用内下载安装`,
       };
     default:
       return { title: '', subtitle: '' };
@@ -542,15 +548,15 @@ function SettingsSheetBody({ onRequestExpand }: { onRequestExpand?: () => void }
   const clearAudioCache = usePlayerStore((s) => s.clearAudioCache);
   const clearMetadataCache = usePlayerStore((s) => s.clearMetadataCache);
   const updateEndpoints = usePlayerStore((s) => s.updateEndpoints);
-  const openExternalLink = usePlayerStore((s) => s.openExternalLink);
   const showToast = usePlayerStore((s) => s.showToast);
+  const updateInfo = usePlayerStore((s) => s.updateInfo);
+  const checkingUpdate = usePlayerStore((s) => s.checkingUpdate);
+  const updateCheckError = usePlayerStore((s) => s.updateCheckError);
+  const checkForUpdates = usePlayerStore((s) => s.checkForUpdates);
 
   const [activeCat, setActiveCat] = useState<(typeof SETTINGS_CATEGORIES)[number]['id']>('playback');
   const [, setClockTick] = useState(0);
   const [cacheStats, setCacheStats] = useState({ audioBytes: 0, playlistCount: 0, lyricCount: 0 });
-  const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const [updateResult, setUpdateResult] = useState<AppUpdateCheckResult | null>(null);
-  const [updateError, setUpdateError] = useState<string | null>(null);
 
   // Hidden Easter Egg: tap version footer 5 times to unlock developer endpoints
   const [eggClicks, setEggClicks] = useState(0);
@@ -589,17 +595,10 @@ function SettingsSheetBody({ onRequestExpand }: { onRequestExpand?: () => void }
   };
 
   const onCheckUpdate = async () => {
-    setCheckingUpdate(true);
-    setUpdateError(null);
-    try {
-      const res = await checkForAppUpdate();
-      setUpdateResult(res);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '检查更新失败';
-      setUpdateError(msg);
-      showToast(msg);
-    } finally {
-      setCheckingUpdate(false);
+    const res = await checkForUpdates({ silent: false });
+    if (!res) {
+      const err = usePlayerStore.getState().updateCheckError;
+      if (err) showToast(err);
     }
   };
 
@@ -835,36 +834,17 @@ function SettingsSheetBody({ onRequestExpand }: { onRequestExpand?: () => void }
             </button>
           </div>
 
-          {updateError && (
-            <div style={{ fontSize: 12, color: '#fca5a5' }}>{updateError}</div>
+          {updateCheckError && (
+            <div style={{ fontSize: 12, color: '#fca5a5' }}>{updateCheckError}</div>
           )}
 
-          {updateResult && (
+          {updateInfo && (
             <div className="info-panel">
-              {updateResult.hasUpdate ? (
-                <>
-                  <div className="info-row">
-                    <span>发现新版本</span>
-                    <strong>v{updateResult.latestVersion}</strong>
-                  </div>
-                  {updateResult.releaseNotes && (
-                    <div style={{ fontSize: 12, color: 'var(--ink-2)', lineHeight: 1.45, whiteSpace: 'pre-wrap' }}>
-                      {updateResult.releaseNotes.slice(0, 260)}
-                    </div>
-                  )}
-                  <button
-                    type="button"
-                    className="primary-btn tap"
-                    style={{ height: 36, fontSize: 13 }}
-                    onClick={() => openExternalLink(updateResult.downloadUrl)}
-                  >
-                    <IconDownload size={14} />
-                    <span>前往下载新版 APK</span>
-                  </button>
-                </>
+              {updateInfo.hasUpdate ? (
+                <UpdateDownloadControls compact />
               ) : (
                 <div style={{ fontSize: 12.5, color: 'var(--ink-2)' }}>
-                  {updateResult.noPublishedRelease
+                  {updateInfo.noPublishedRelease
                     ? `当前版本 v${APP_VERSION}（GitHub Releases 暂未发布 Tag 版本）`
                     : `已是最新版本（v${APP_VERSION}）`}
                 </div>
@@ -1059,6 +1039,143 @@ function PlaylistManageSheetBody() {
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+function UpdateDownloadControls({ compact = false }: { compact?: boolean }) {
+  const updateInfo = usePlayerStore((s) => s.updateInfo);
+  const status = usePlayerStore((s) => s.updateDownloadStatus);
+  const downloadedBytes = usePlayerStore((s) => s.updateDownloadedBytes);
+  const totalBytes = usePlayerStore((s) => s.updateTotalBytes);
+  const percent = usePlayerStore((s) => s.updatePercent);
+  const downloadError = usePlayerStore((s) => s.updateDownloadError);
+  const startAppUpdateDownload = usePlayerStore((s) => s.startAppUpdateDownload);
+  const cancelAppUpdateDownload = usePlayerStore((s) => s.cancelAppUpdateDownload);
+  const installDownloadedUpdate = usePlayerStore((s) => s.installDownloadedUpdate);
+  const openExternalLink = usePlayerStore((s) => s.openExternalLink);
+
+  if (!updateInfo) return null;
+
+  const nativeSupported = isNativeApkUpdateSupported();
+  const isDownloading = status === 'downloading';
+  const isReadyOrPerm = status === 'ready' || status === 'permission_required' || status === 'installing';
+
+  return (
+    <div className="form-stack" style={{ gap: 10 }}>
+      <div className="info-row">
+        <span>发现新版本</span>
+        <span className="update-version-badge">
+          v{APP_VERSION} → v{updateInfo.latestVersion}
+        </span>
+      </div>
+
+      {updateInfo.releaseNotes && (
+        <div className={`update-notes-box ${compact ? 'compact' : ''}`}>
+          {compact ? updateInfo.releaseNotes.slice(0, 360) : updateInfo.releaseNotes}
+        </div>
+      )}
+
+      {isDownloading && (
+        <div className="form-stack" style={{ gap: 6 }}>
+          <div className="update-progress-bar">
+            <div
+              className={`update-progress-fill ${totalBytes <= 0 ? 'indeterminate' : ''}`}
+              style={{ width: totalBytes > 0 ? `${Math.max(4, percent)}%` : '40%' }}
+            />
+          </div>
+          <div className="info-row" style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>
+            <span>
+              正在下载安装包… {formatBytesMb(downloadedBytes)}
+              {totalBytes > 0 ? ` / ${formatBytesMb(totalBytes)}` : ''}
+            </span>
+            <strong>{totalBytes > 0 ? `${percent}%` : '连接中'}</strong>
+          </div>
+        </div>
+      )}
+
+      {downloadError && (
+        <div
+          style={{
+            fontSize: 12,
+            color: status === 'permission_required' ? '#fde68a' : '#fca5a5',
+            lineHeight: 1.45,
+          }}
+        >
+          {downloadError}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8 }}>
+        {isDownloading ? (
+          <button
+            type="button"
+            className="secondary-btn tap"
+            style={{ flex: 1, height: 38, fontSize: 13 }}
+            onClick={() => cancelAppUpdateDownload()}
+          >
+            取消下载
+          </button>
+        ) : isReadyOrPerm ? (
+          <button
+            type="button"
+            className="primary-btn tap"
+            style={{ flex: 1, height: 38, fontSize: 13 }}
+            onClick={() => installDownloadedUpdate()}
+          >
+            <IconDownload size={14} />
+            <span>{status === 'permission_required' ? '已授权，立即安装' : '立即安装新版'}</span>
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="primary-btn tap"
+            style={{ flex: 1, height: 38, fontSize: 13 }}
+            onClick={() => startAppUpdateDownload()}
+          >
+            <IconDownload size={14} />
+            <span>{nativeSupported ? '应用内立即更新' : '前往下载新版 APK'}</span>
+          </button>
+        )}
+
+        {nativeSupported && (
+          <button
+            type="button"
+            className="secondary-btn tap"
+            style={{ height: 38, padding: '0 12px', fontSize: 12.5, flexShrink: 0 }}
+            onClick={() => openExternalLink(updateInfo.downloadUrl)}
+          >
+            浏览器下载
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AppUpdateSheetBody() {
+  const updateInfo = usePlayerStore((s) => s.updateInfo);
+  const status = usePlayerStore((s) => s.updateDownloadStatus);
+  const dismissAppUpdate = usePlayerStore((s) => s.dismissAppUpdate);
+
+  if (!updateInfo) return null;
+
+  return (
+    <div className="form-stack" style={{ gap: 14, paddingBottom: 28 }}>
+      <div className="miuix-card">
+        <UpdateDownloadControls />
+      </div>
+
+      {status !== 'downloading' && (
+        <button
+          type="button"
+          className="secondary-btn tap"
+          style={{ width: '100%', height: 40, fontSize: 13.5 }}
+          onClick={() => dismissAppUpdate()}
+        >
+          暂不更新此版本
+        </button>
+      )}
     </div>
   );
 }

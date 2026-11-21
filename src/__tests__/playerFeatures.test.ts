@@ -316,4 +316,64 @@ describe('Player store v1.1 native preloading, sleep timer, queue, auto-skip & s
     expect(h.nextCalls.length).toBe(1);
     expect(h.nextCalls[0].trackId).toBe('1001');
   });
+
+  it('drives in-app APK download progress, permission prompt, and native install via bridge', async () => {
+    const h = await setupHarness();
+    const downloadCalls: { url: string; version: string }[] = [];
+    let cancelCalls = 0;
+    let installCalls = 0;
+
+    h.mockWin.CPlayerNativeMedia.downloadAndInstallApk = (url, version) => {
+      downloadCalls.push({ url, version });
+      return true;
+    };
+    h.mockWin.CPlayerNativeMedia.cancelApkDownload = () => {
+      cancelCalls++;
+      return true;
+    };
+    h.mockWin.CPlayerNativeMedia.installDownloadedApk = () => {
+      installCalls++;
+      return true;
+    };
+
+    h.usePlayerStore.setState({
+      updateInfo: {
+        hasUpdate: true,
+        currentVersion: '1.1.1',
+        latestVersion: '1.2.0',
+        releaseName: 'CPlayer v1.2.0',
+        releaseNotes: '中文更新日志',
+        downloadUrl: 'https://github.com/ChKSz/cplayer-native/releases/download/v1.2.0/cplayer.apk',
+        releaseUrl: 'https://github.com/ChKSz/cplayer-native/releases/tag/v1.2.0',
+      },
+    });
+
+    h.usePlayerStore.getState().startAppUpdateDownload();
+    expect(downloadCalls).toEqual([
+      {
+        url: 'https://github.com/ChKSz/cplayer-native/releases/download/v1.2.0/cplayer.apk',
+        version: '1.2.0',
+      },
+    ]);
+    expect(h.usePlayerStore.getState().updateDownloadStatus).toBe('downloading');
+
+    const updateBridge = (h.mockWin as { __cplayerUpdateBridge?: { onEvent?: (j: string) => void } })
+      .__cplayerUpdateBridge;
+    updateBridge?.onEvent?.(
+      JSON.stringify({ status: 'downloading', downloadedBytes: 5_000_000, totalBytes: 10_000_000, percent: 50 }),
+    );
+    expect(h.usePlayerStore.getState().updatePercent).toBe(50);
+
+    updateBridge?.onEvent?.(
+      JSON.stringify({ status: 'permission_required', downloadedBytes: 10_000_000, totalBytes: 10_000_000, percent: 100 }),
+    );
+    expect(h.usePlayerStore.getState().updateDownloadStatus).toBe('permission_required');
+
+    h.usePlayerStore.getState().installDownloadedUpdate();
+    expect(installCalls).toBe(1);
+
+    h.usePlayerStore.getState().cancelAppUpdateDownload();
+    expect(cancelCalls).toBe(1);
+    expect(h.usePlayerStore.getState().updateDownloadStatus).toBe('idle');
+  });
 });

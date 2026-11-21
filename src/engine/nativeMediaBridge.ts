@@ -27,6 +27,9 @@ export interface CPlayerNativeMediaApi {
   clearAudioCache?: () => boolean;
   isMeteredNetwork?: () => boolean;
   openExternalUrl?: (url: string) => boolean;
+  downloadAndInstallApk?: (url: string, version: string) => boolean;
+  cancelApkDownload?: () => boolean;
+  installDownloadedApk?: () => boolean;
   play(): void;
   pause(): void;
   seekTo(ms: number): void;
@@ -42,10 +45,21 @@ export interface NativeMediaCallbacks {
   onSleepTimerFired?: (mode: 'timed' | 'track') => void;
 }
 
+export interface NativeUpdateEventPayload {
+  status: 'downloading' | 'ready' | 'permission_required' | 'installing' | 'cancelled' | 'error';
+  downloadedBytes?: number;
+  totalBytes?: number;
+  percent?: number;
+  message?: string;
+}
+
 declare global {
   interface Window {
     CPlayerNativeMedia?: CPlayerNativeMediaApi;
     __cplayerNativeBridge?: NativeMediaCallbacks;
+    __cplayerUpdateBridge?: {
+      onEvent?: (payloadJson: string) => void;
+    };
   }
 }
 

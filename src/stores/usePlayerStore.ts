@@ -34,6 +34,17 @@ import {
   removeSearchHistoryItem,
 } from '../services/searchHistory';
 import {
+  cancelNativeApkDownload,
+  checkForAppUpdate,
+  getDismissedUpdateVersion,
+  isNativeApkUpdateSupported,
+  registerNativeUpdateListener,
+  setDismissedUpdateVersion,
+  startNativeApkDownload,
+  triggerNativeApkInstall,
+  type AppUpdateCheckResult,
+} from '../services/appUpdater';
+import {
   songSourceOf,
   type AuthUser,
   type LyricLine,
@@ -57,7 +68,16 @@ export type ActiveSheetType =
   | 'createPlaylist'
   | 'playlistManage'
   | 'trackAction'
-  | 'addToPlaylist';
+  | 'addToPlaylist'
+  | 'appUpdate';
+
+export type UpdateDownloadStatus =
+  | 'idle'
+  | 'downloading'
+  | 'ready'
+  | 'permission_required'
+  | 'installing'
+  | 'error';
 
 export type LyricFontSize = 'sm' | 'md' | 'lg';
 export type SleepTimerMode = 'off' | '15' | '30' | '60' | 'track';
@@ -246,6 +266,16 @@ export interface PlayerStoreState {
   searchError: string | null;
   searchHistory: string[];
 
+  // In-App Update
+  updateInfo: AppUpdateCheckResult | null;
+  checkingUpdate: boolean;
+  updateCheckError: string | null;
+  updateDownloadStatus: UpdateDownloadStatus;
+  updateDownloadedBytes: number;
+  updateTotalBytes: number;
+  updatePercent: number;
+  updateDownloadError: string | null;
+
   // Actions
   init: () => Promise<void>;
   setActiveTab: (tab: number) => void;
@@ -273,6 +303,11 @@ export interface PlayerStoreState {
   clearAudioCache: () => boolean;
   clearMetadataCache: () => Promise<void>;
   openExternalLink: (url: string) => boolean;
+  checkForUpdates: (opts?: { silent?: boolean }) => Promise<AppUpdateCheckResult | null>;
+  startAppUpdateDownload: () => void;
+  cancelAppUpdateDownload: () => void;
+  installDownloadedUpdate: () => void;
+  dismissAppUpdate: () => void;
 
   // Playlists & Favorites
   selectCloudPlaylist: (id: string, force?: boolean) => Promise<void>;
@@ -833,6 +868,15 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
     searchError: null,
     searchHistory: loadSearchHistory(),
 
+    updateInfo: null,
+    checkingUpdate: false,
+    updateCheckError: null,
+    updateDownloadStatus: 'idle',
+    updateDownloadedBytes: 0,
+    updateTotalBytes: -1,
+    updatePercent: 0,
+    updateDownloadError: null,
+
     init: async () => {
       if (initialized) return;
       initialized = true;
@@ -840,6 +884,57 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
       set({ isMeteredNetwork: engine.isMeteredNetwork() });
       syncRepeatMode();
       syncFavoriteSnapshot();
+
+      registerNativeUpdateListener((ev) => {
+        if (ev.status === 'downloading') {
+          set({
+            updateDownloadStatus: 'downloading',
+            updateDownloadedBytes: ev.downloadedBytes ?? 0,
+            updateTotalBytes: ev.totalBytes ?? -1,
+            updatePercent: ev.percent ?? 0,
+            updateDownloadError: null,
+          });
+        } else if (ev.status === 'ready') {
+          set({
+            updateDownloadStatus: 'ready',
+            updateDownloadedBytes: ev.downloadedBytes ?? get().updateDownloadedBytes,
+            updateTotalBytes: ev.totalBytes ?? get().updateTotalBytes,
+            updatePercent: 100,
+            updateDownloadError: null,
+          });
+        } else if (ev.status === 'permission_required') {
+          set({
+            updateDownloadStatus: 'permission_required',
+            updatePercent: 100,
+            updateDownloadError: ev.message || '请允许安装未知应用后返回点击立即安装',
+          });
+        } else if (ev.status === 'installing') {
+          set({
+            updateDownloadStatus: 'installing',
+            updatePercent: 100,
+            updateDownloadError: null,
+          });
+        } else if (ev.status === 'cancelled') {
+          set({
+            updateDownloadStatus: 'idle',
+            updateDownloadedBytes: 0,
+            updateTotalBytes: -1,
+            updatePercent: 0,
+            updateDownloadError: null,
+          });
+        } else if (ev.status === 'error') {
+          set({
+            updateDownloadStatus: 'error',
+            updateDownloadError: ev.message || '安装包下载失败',
+          });
+        }
+      });
+
+      if (typeof document !== 'undefined') {
+        setTimeout(() => {
+          void get().checkForUpdates({ silent: true });
+        }, 2500);
+      }
 
       cpSync.addEventListener('status', (e) => {
         const detail = (e as CustomEvent<{ status: SyncStatusType }>).detail;
@@ -1088,6 +1183,80 @@ export const usePlayerStore = create<PlayerStoreState>((set, get) => {
 
     openExternalLink: (url) => {
       return ensureAudioEngine().openExternalUrl(url);
+    },
+
+    checkForUpdates: async (opts = {}) => {
+      const silent = Boolean(opts.silent);
+      if (get().checkingUpdate) return get().updateInfo;
+      set({ checkingUpdate: true, ...(silent ? {} : { updateCheckError: null }) });
+      try {
+        const result = await checkForAppUpdate();
+        set({ updateInfo: result, checkingUpdate: false, updateCheckError: null });
+        if (result.hasUpdate && silent) {
+          const dismissed = getDismissedUpdateVersion();
+          if (dismissed !== result.latestVersion && !get().activeSheet) {
+            get().openSheet('appUpdate');
+          }
+        }
+        return result;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '检查更新失败';
+        set({ checkingUpdate: false, ...(silent ? {} : { updateCheckError: msg }) });
+        return null;
+      }
+    },
+
+    startAppUpdateDownload: () => {
+      const info = get().updateInfo;
+      if (!info?.downloadUrl) return;
+      const isApkLink = /\.apk(\?|$)/i.test(info.downloadUrl);
+      if (isNativeApkUpdateSupported() && isApkLink) {
+        set({
+          updateDownloadStatus: 'downloading',
+          updateDownloadedBytes: 0,
+          updateTotalBytes: -1,
+          updatePercent: 0,
+          updateDownloadError: null,
+        });
+        const ok = startNativeApkDownload(info.downloadUrl, info.latestVersion);
+        if (!ok) {
+          set({
+            updateDownloadStatus: 'error',
+            updateDownloadError: '无法启动应用内下载，请改用浏览器下载',
+          });
+        }
+        return;
+      }
+      get().openExternalLink(info.downloadUrl);
+    },
+
+    cancelAppUpdateDownload: () => {
+      cancelNativeApkDownload();
+      set({
+        updateDownloadStatus: 'idle',
+        updateDownloadedBytes: 0,
+        updateTotalBytes: -1,
+        updatePercent: 0,
+        updateDownloadError: null,
+      });
+    },
+
+    installDownloadedUpdate: () => {
+      const ok = triggerNativeApkInstall();
+      if (!ok) {
+        get().showToast('安装包不存在，请重新下载');
+        set({ updateDownloadStatus: 'idle', updatePercent: 0 });
+      }
+    },
+
+    dismissAppUpdate: () => {
+      const info = get().updateInfo;
+      if (info?.latestVersion) {
+        setDismissedUpdateVersion(info.latestVersion);
+      }
+      if (get().activeSheet === 'appUpdate') {
+        get().closeSheet();
+      }
     },
 
     selectCloudPlaylist: async (id, force = false) => {
