@@ -6,11 +6,11 @@ on:
       build_mode:
         description: 'APK Build Mode'
         required: true
-        default: 'debug'
+        default: 'release'
         type: choice
         options:
-          - debug
           - release
+          - debug
   push:
     branches: [main]
     tags: ['v*']
@@ -22,7 +22,7 @@ jobs:
   build-android-apk:
     runs-on: ubuntu-24.04
     env:
-      # Job-level env so the signing step's `if` can check it (secrets context is not allowed in step `if`)
+      # Job-level env so signing logic can inspect it (secrets context is not allowed in step `if`)
       KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
 
     steps:
@@ -78,7 +78,7 @@ jobs:
 
       - name: Build Android APK (arm64-v8a)
         env:
-          BUILD_MODE: ${{ github.event.inputs.build_mode || (startsWith(github.ref, 'refs/tags/v') && 'release' || 'debug') }}
+          BUILD_MODE: ${{ github.event.inputs.build_mode || 'release' }}
         run: |
           if [ "$BUILD_MODE" = "release" ]; then
             npx tauri android build --apk --target aarch64 --ci
@@ -86,17 +86,22 @@ jobs:
             npx tauri android build --apk --target aarch64 --debug --ci
           fi
 
-      - name: Sign Release APK (optional if keystore secrets configured)
-        if: ${{ env.KEYSTORE_BASE64 != '' }}
+      - name: Align & Sign Release APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           UNSIGNED_APK=$(find src-tauri/gen/android/app/build/outputs/apk -name "*unsigned*.apk" | head -n 1)
-          if [ -n "$UNSIGNED_APK" ]; then
+          if [ -z "$UNSIGNED_APK" ]; then
+            echo "No unsigned release APK found (debug build is already debug-signed); skipping signing."
+            exit 0
+          fi
+          ZIPALIGN="${ANDROID_HOME}/build-tools/35.0.0/zipalign"
+          APKSIGNER="${ANDROID_HOME}/build-tools/35.0.0/apksigner"
+          "$ZIPALIGN" -f -p 4 "$UNSIGNED_APK" /tmp/aligned.apk
+          if [ -n "$KEYSTORE_BASE64" ]; then
             echo "$KEYSTORE_BASE64" | base64 --decode > /tmp/release.keystore
-            APKSIGNER="${ANDROID_HOME}/build-tools/35.0.0/apksigner"
             SIGNED_APK="${UNSIGNED_APK/-unsigned/-signed}"
             "$APKSIGNER" sign \
               --ks /tmp/release.keystore \
@@ -104,15 +109,45 @@ jobs:
               --ks-key-alias "$KEY_ALIAS" \
               --key-pass "pass:${KEY_PASSWORD}" \
               --out "$SIGNED_APK" \
-              "$UNSIGNED_APK"
-            rm -f /tmp/release.keystore
+              /tmp/aligned.apk
+            rm -f /tmp/release.keystore /tmp/aligned.apk "$UNSIGNED_APK"
+          else
+            echo "::notice::ANDROID_KEYSTORE_BASE64 is not configured; signing release APK with ephemeral debug keystore. Configure release keystore secrets for overwrite-install upgrades."
+            keytool -genkeypair -v \
+              -keystore /tmp/debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
+            SIGNED_APK="${UNSIGNED_APK/-unsigned/-debug-signed}"
+            "$APKSIGNER" sign \
+              --ks /tmp/debug.keystore \
+              --ks-pass "pass:android" \
+              --ks-key-alias androiddebugkey \
+              --key-pass "pass:android" \
+              --out "$SIGNED_APK" \
+              /tmp/aligned.apk
+            rm -f /tmp/debug.keystore /tmp/aligned.apk "$UNSIGNED_APK"
           fi
+          "$APKSIGNER" verify "$SIGNED_APK"
 
       - name: Collect APK artifact
         run: |
           mkdir -p dist-apk
-          find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" -exec cp -v {} dist-apk/ \;
+          find src-tauri/gen/android/app/build/outputs/apk -name "*.apk" ! -name "*unsigned*.apk" -exec cp -v {} dist-apk/ \;
           ls -lh dist-apk/
+          python3 - <<'PY'
+          import glob, os, zipfile
+          for apk_path in sorted(glob.glob("dist-apk/*.apk")):
+              size_mb = os.path.getsize(apk_path) / (1024 * 1024)
+              print(f"=== {os.path.basename(apk_path)}: {size_mb:.2f} MB ===")
+              with zipfile.ZipFile(apk_path, "r") as z:
+                  for info in sorted(z.infolist(), key=lambda x: -x.compress_size)[:15]:
+                      print(f"  {info.compress_size/1024:8.1f} KB (raw {info.file_size/1024:8.1f} KB)  {info.filename}")
+          PY
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4

@@ -10,7 +10,7 @@
   - `CPlayerSync` 账号登录 → 同域换取 5 分钟短期成员播放凭证（仅发往官方音乐 API，绝不持久化、绝不泄露登录态、绝不附加到音频 CDN）。
   - 支持网易云 / QQ 音乐 / 酷狗多音源搜索、网易云 9 档音质切换、酷狗签名播放地址优先与过期流单次自恢复（`MediaRecovery`）。
   - 支持云歌单同步与网易云歌单 ID / 分享短链导入（已移除本地 JSON 导入）。
-- **Tauri 2 Android 原生适配**：Rust `reqwest` 代理规避 WebView CORS/Origin 限制，`tauri-plugin-haptics` 原生震动，Edge-to-Edge 全透明状态栏/手势条，返回键优先收起面板并后台保活。
+- **Tauri 2 Android 原生适配**：Android 端采用 Kotlin 原生 `HttpURLConnection` JS Bridge 规避 WebView CORS/Origin 限制（零 Rust TLS/HTTP 体积开销，桌面端保留 Rust `reqwest`），结合 AndroidX Media3 前台服务与通知栏控播、`tauri-plugin-haptics` 原生震动、Edge-to-Edge 全透明状态栏/手势条，以及返回键优先收起面板并后台保活。
 
 ## 本地预览与测试（仅需 Node.js）
 
@@ -25,12 +25,12 @@ npm run dev
 ## GitHub Actions 一键云端打包 APK
 
 1. 将本目录推送到你的 GitHub 仓库（`main` 分支）。
-2. 在 GitHub 仓库打开 **Actions → Build Android APK (Tauri 2) → Run workflow**（或在每次推送到 `main` 时自动触发）。
+2. 在 GitHub 仓库打开 **Actions → Build Android APK (Tauri 2) → Run workflow**（或在每次推送到 `main` / 打 `v*` Tag 时自动触发），默认直接构建经过 R8 优化与体积裁剪的 **Release APK**（也可手动选择 `debug` 模式）。
 3. 构建完成后，在 Workflow 页面的 **Artifacts** 中直接下载 `cplayer-android-arm64-apk` 解压安装即可。
 
-### 可选：配置签名 Release APK
+### 可选：配置固定签名 Keystore（支持覆盖安装更新）
 
-如需构建正式签名 Release APK（支持覆盖安装更新），在仓库 **Settings → Secrets and variables → Actions** 中添加以下 4 个 Secret，并在打 `v*` Tag 或手动选择 `release` 模式时自动签名：
+未配置 Secrets 时，CI 会自动使用临时 Debug Keystore 对 Release APK 进行签名，确保产物可直接安装；如需使用固定正式证书签名以支持覆盖安装更新，请在仓库 **Settings → Secrets and variables → Actions** 中添加以下 4 个 Secret：
 
 - `ANDROID_KEYSTORE_BASE64`（`.keystore` 文件的 Base64 编码）
 - `ANDROID_KEYSTORE_PASSWORD`

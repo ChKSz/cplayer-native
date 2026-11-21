@@ -3,6 +3,7 @@ import { join } from 'node:path';
 
 const androidRoot = join(process.cwd(), 'src-tauri', 'gen', 'android');
 const gradlePath = join(androidRoot, 'app', 'build.gradle.kts');
+const proguardPath = join(androidRoot, 'app', 'proguard-cplayer.pro');
 const manifestPath = join(androidRoot, 'app', 'src', 'main', 'AndroidManifest.xml');
 const pkgDir = join(
   androidRoot,
@@ -22,9 +23,11 @@ if (!existsSync(androidRoot)) {
   process.exit(1);
 }
 
-// 1. Patch app/build.gradle.kts with AndroidX Media3 dependencies
+// 1. Patch app/build.gradle.kts with AndroidX Media3 dependencies & APK size optimizations
 if (existsSync(gradlePath)) {
   let gradle = readFileSync(gradlePath, 'utf8');
+  let gradleChanged = false;
+
   if (!gradle.includes('androidx.media3:media3-exoplayer')) {
     const media3Deps = `
     val media3Version = "1.5.1"
@@ -37,12 +40,74 @@ if (existsSync(gradlePath)) {
     } else {
       gradle += `\ndependencies {\n${media3Deps}\n}\n`;
     }
-    writeFileSync(gradlePath, gradle, 'utf8');
+    gradleChanged = true;
     console.log('[patch-android] Added AndroidX Media3 dependencies to build.gradle.kts');
+  }
+
+  // Strip debug symbols from debug .so as well (prevents 120+ MB unstripped Rust .so in debug APKs)
+  const withoutKeepDebug = gradle.replace(/^\s*jniLibs\.keepDebugSymbols\.add\([^\n]*\)\r?\n?/gm, '');
+  if (withoutKeepDebug !== gradle) {
+    gradle = withoutKeepDebug;
+    gradleChanged = true;
+    console.log('[patch-android] Removed jniLibs.keepDebugSymbols from debug buildType');
+  }
+
+  // Enable compressed jniLibs, locale filtering (zh/en), and metadata exclusions
+  if (!gradle.includes('useLegacyPackaging')) {
+    const sizeOptBlock = `    androidResources {
+        localeFilters.addAll(listOf("zh", "en"))
+    }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+        resources {
+            excludes += setOf(
+                "META-INF/AL2.0",
+                "META-INF/LGPL2.1",
+                "META-INF/DEPENDENCIES",
+                "META-INF/**/LICENSE*",
+                "META-INF/**/NOTICE*",
+                "DebugProbesKt.bin",
+            )
+        }
+    }
+`;
+    if (/^[ \t]*compileOptions\s*\{/m.test(gradle)) {
+      gradle = gradle.replace(/^[ \t]*compileOptions\s*\{/m, (match) => `${sizeOptBlock}${match}`);
+      gradleChanged = true;
+      console.log('[patch-android] Added androidResources.localeFilters & packaging compression to build.gradle.kts');
+    } else {
+      console.warn('[patch-android] Could not locate compileOptions block in build.gradle.kts; skipped packaging patch');
+    }
+  }
+
+  if (gradleChanged) {
+    writeFileSync(gradlePath, gradle, 'utf8');
   }
 }
 
-// 2. Patch AndroidManifest.xml with media playback permissions and MediaSessionService declaration
+// 2. Write R8 / ProGuard keep rules for WebView @JavascriptInterface bridges & playback service
+const proguardRules = `# Keep CPlayer WebView @JavascriptInterface bridges under R8 full optimization
+-keepattributes *Annotation*
+-keepclassmembers class top.chksz.cplayer.MainActivity$NativeMediaBridge {
+    @android.webkit.JavascriptInterface <methods>;
+}
+-keepclassmembers class top.chksz.cplayer.MainActivity$NativeHttpBridge {
+    @android.webkit.JavascriptInterface <methods>;
+}
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
+-keep class top.chksz.cplayer.MainActivity { *; }
+-keep class top.chksz.cplayer.CPlayerPlaybackService { *; }
+`;
+if (existsSync(join(androidRoot, 'app'))) {
+  writeFileSync(proguardPath, proguardRules, 'utf8');
+  console.log('[patch-android] Wrote app/proguard-cplayer.pro');
+}
+
+// 3. Patch AndroidManifest.xml with media playback permissions and MediaSessionService declaration
 if (existsSync(manifestPath)) {
   let manifest = readFileSync(manifestPath, 'utf8');
   const requiredPerms = [
@@ -80,7 +145,7 @@ if (existsSync(manifestPath)) {
   console.log('[patch-android] Patched AndroidManifest.xml');
 }
 
-// 3. Generate CPlayerPlaybackService.kt (ExoPlayer + MediaSessionService + Background Keep-Alive)
+// 4. Generate CPlayerPlaybackService.kt (ExoPlayer + MediaSessionService + Background Keep-Alive)
 const playbackServiceKotlin = `package top.chksz.cplayer
 
 import android.app.PendingIntent
@@ -188,7 +253,7 @@ class CPlayerPlaybackService : MediaSessionService() {
 }
 `;
 
-// 4. Patch MainActivity.kt (Edge-to-Edge + MediaController JS Bridge + Back-to-Background)
+// 5. Patch MainActivity.kt (Edge-to-Edge + MediaController JS Bridge + Native HTTP Bridge + Back-to-Background)
 const mainActivityKotlin = `package top.chksz.cplayer
 
 import android.Manifest
@@ -215,13 +280,38 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.zip.GZIPInputStream
+import java.util.zip.InflaterInputStream
 
 class MainActivity : TauriActivity() {
+  private class ActiveHttpCall {
+    @Volatile
+    var connection: HttpURLConnection? = null
+
+    @Volatile
+    var cancelled: Boolean = false
+
+    @Volatile
+    var future: Future<*>? = null
+  }
+
   private var webViewRef: WebView? = null
   private val mainHandler = Handler(Looper.getMainLooper())
   private var controllerFuture: ListenableFuture<MediaController>? = null
   private var mediaController: MediaController? = null
   private var pendingAction: ((MediaController) -> Unit)? = null
+  private val httpExecutor: ExecutorService = Executors.newCachedThreadPool()
+  private val activeHttpCalls = ConcurrentHashMap<String, ActiveHttpCall>()
 
   private val progressTicker = object : Runnable {
     override fun run() {
@@ -235,6 +325,232 @@ class MainActivity : TauriActivity() {
   private fun emitJs(script: String) {
     mainHandler.post {
       webViewRef?.evaluateJavascript(script, null)
+    }
+  }
+
+  private fun jsStringLiteral(value: String): String {
+    return JSONObject.quote(value)
+      .replace("\\u2028", "\\\\u2028")
+      .replace("\\u2029", "\\\\u2029")
+  }
+
+  private fun validateAndParseUrl(rawUrl: String): URL {
+    val parsed = try {
+      URL(rawUrl)
+    } catch (e: Exception) {
+      val detail = e.message ?: rawUrl
+      throw IllegalArgumentException("无效请求地址: $detail")
+    }
+    val scheme = parsed.protocol.lowercase(Locale.ROOT)
+    val host = parsed.host?.lowercase(Locale.ROOT)
+    when (scheme) {
+      "https" -> {
+        if (host.isNullOrBlank()) {
+          throw IllegalArgumentException("无效请求地址: 缺少主机名")
+        }
+      }
+      "http" -> {
+        if (host != "localhost" && host != "127.0.0.1") {
+          throw IllegalArgumentException("不支持的协议: $scheme")
+        }
+      }
+      else -> throw IllegalArgumentException("不支持的协议: $scheme")
+    }
+    return parsed
+  }
+
+  private fun effectivePort(url: URL): Int {
+    if (url.port != -1) return url.port
+    return if (url.protocol.equals("https", ignoreCase = true)) 443 else 80
+  }
+
+  private fun executeNativeHttp(
+    reqId: String,
+    call: ActiveHttpCall,
+    rawUrl: String,
+    method: String,
+    headersJson: String,
+    hasBody: Boolean,
+    body: String,
+    rejectRedirects: Boolean,
+  ) {
+    try {
+      if (call.cancelled || Thread.currentThread().isInterrupted) return
+
+      val currentHeaders = LinkedHashMap<String, String>()
+      if (headersJson.isNotBlank()) {
+        val obj = JSONObject(headersJson)
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+          val k = keys.next()
+          if (!obj.isNull(k)) {
+            currentHeaders[k] = obj.optString(k, "")
+          }
+        }
+      }
+
+      var currentUrl = validateAndParseUrl(rawUrl)
+      var currentMethod = method.trim().uppercase(Locale.ROOT).ifEmpty { "GET" }
+      var currentHasBody = hasBody
+      var currentBody = body
+
+      for (hop in 0..5) {
+        if (call.cancelled || Thread.currentThread().isInterrupted) return
+
+        val conn = currentUrl.openConnection() as HttpURLConnection
+        call.connection = conn
+        conn.instanceFollowRedirects = false
+        conn.connectTimeout = 25_000
+        conn.readTimeout = 25_000
+        conn.useCaches = false
+        conn.doInput = true
+        conn.requestMethod = currentMethod
+
+        var hasUserAgent = false
+        for ((k, v) in currentHeaders) {
+          if (k.equals("user-agent", ignoreCase = true)) {
+            hasUserAgent = true
+          }
+          conn.setRequestProperty(k, v)
+        }
+        if (!hasUserAgent) {
+          conn.setRequestProperty("User-Agent", "CPlayer-Native/1.0 (Android; Tauri2)")
+        }
+
+        if (currentHasBody) {
+          val bodyBytes = currentBody.toByteArray(Charsets.UTF_8)
+          conn.doOutput = true
+          conn.setFixedLengthStreamingMode(bodyBytes.size)
+          conn.outputStream.use { out ->
+            out.write(bodyBytes)
+          }
+        } else if (currentMethod == "POST" || currentMethod == "PUT" || currentMethod == "PATCH") {
+          conn.doOutput = true
+          conn.setFixedLengthStreamingMode(0)
+          conn.outputStream.close()
+        }
+
+        val status = conn.responseCode
+        if (status in 300..399) {
+          if (rejectRedirects) {
+            conn.disconnect()
+            throw IllegalStateException("已拦截非预期的重定向响应")
+          }
+          val location = conn.getHeaderField("Location")?.trim()
+          if (!location.isNullOrEmpty() && status in listOf(301, 302, 303, 307, 308)) {
+            if (hop == 5) {
+              conn.disconnect()
+              throw IllegalStateException("重定向次数过多")
+            }
+            val nextUrl = validateAndParseUrl(URL(currentUrl, location).toString())
+            val sameOrigin =
+              currentUrl.protocol.equals(nextUrl.protocol, ignoreCase = true) &&
+                currentUrl.host.equals(nextUrl.host, ignoreCase = true) &&
+                effectivePort(currentUrl) == effectivePort(nextUrl)
+            if (!sameOrigin) {
+              val iter = currentHeaders.entries.iterator()
+              while (iter.hasNext()) {
+                val keyLower = iter.next().key.lowercase(Locale.ROOT)
+                if (keyLower == "authorization" || keyLower == "cookie") {
+                  iter.remove()
+                }
+              }
+            }
+            if (status == 303 || ((status == 301 || status == 302) && currentMethod == "POST")) {
+              currentMethod = "GET"
+              currentHasBody = false
+              currentBody = ""
+              val iter = currentHeaders.entries.iterator()
+              while (iter.hasNext()) {
+                val keyLower = iter.next().key.lowercase(Locale.ROOT)
+                if (keyLower == "content-type" || keyLower == "content-length") {
+                  iter.remove()
+                }
+              }
+            }
+            conn.disconnect()
+            currentUrl = nextUrl
+            continue
+          }
+        }
+
+        val respHeaders = LinkedHashMap<String, String>()
+        for ((rawKey, values) in conn.headerFields) {
+          if (rawKey != null && values != null && values.isNotEmpty()) {
+            respHeaders[rawKey.lowercase(Locale.ROOT)] = values.joinToString(", ")
+          }
+        }
+
+        val rawStream: InputStream? = if (status >= 400) {
+          conn.errorStream ?: try { conn.inputStream } catch (_: Exception) { null }
+        } else {
+          try { conn.inputStream } catch (_: Exception) { conn.errorStream }
+        }
+
+        val encoding = conn.contentEncoding?.lowercase(Locale.ROOT)?.trim()
+        val bodyText = if (rawStream == null) {
+          ""
+        } else {
+          val decodedStream: InputStream = when (encoding) {
+            "gzip" -> {
+              respHeaders.remove("content-encoding")
+              respHeaders.remove("content-length")
+              GZIPInputStream(BufferedInputStream(rawStream))
+            }
+            "deflate" -> {
+              respHeaders.remove("content-encoding")
+              respHeaders.remove("content-length")
+              InflaterInputStream(BufferedInputStream(rawStream))
+            }
+            else -> BufferedInputStream(rawStream)
+          }
+          decodedStream.use { stream ->
+            val buffer = ByteArrayOutputStream()
+            val chunk = ByteArray(8192)
+            while (true) {
+              if (call.cancelled || Thread.currentThread().isInterrupted) {
+                return
+              }
+              val read = stream.read(chunk)
+              if (read == -1) break
+              buffer.write(chunk, 0, read)
+            }
+            String(buffer.toByteArray(), Charsets.UTF_8)
+          }
+        }
+
+        val payloadJson = JSONObject().apply {
+          put("status", status)
+          put("headers", JSONObject(respHeaders as Map<*, *>))
+          put("body", bodyText)
+        }.toString()
+
+        if (!call.cancelled) {
+          val idLit = jsStringLiteral(reqId)
+          val payloadLit = jsStringLiteral(payloadJson)
+          emitJs("window.__cplayerNativeHttp?.onResolve?.($idLit, $payloadLit)")
+        }
+        return
+      }
+    } catch (e: Exception) {
+      if (!call.cancelled && !Thread.currentThread().isInterrupted) {
+        val errMsg = when (e) {
+          is IllegalArgumentException, is IllegalStateException -> e.message ?: "网络请求失败"
+          else -> {
+            val detail = e.localizedMessage ?: e.message ?: e.javaClass.simpleName
+            "网络请求失败: $detail"
+          }
+        }
+        val idLit = jsStringLiteral(reqId)
+        val msgLit = jsStringLiteral(errMsg)
+        emitJs("window.__cplayerNativeHttp?.onReject?.($idLit, $msgLit)")
+      }
+    } finally {
+      try {
+        call.connection?.disconnect()
+      } catch (_: Exception) {
+      }
+      activeHttpCalls.remove(reqId, call)
     }
   }
 
@@ -254,6 +570,51 @@ class MainActivity : TauriActivity() {
         block(ctrl)
       } else {
         pendingAction = block
+      }
+    }
+  }
+
+  inner class NativeHttpBridge {
+    @JavascriptInterface
+    fun isAvailable(): Boolean = true
+
+    @JavascriptInterface
+    fun request(
+      reqId: String,
+      url: String,
+      method: String,
+      headersJson: String,
+      hasBody: Boolean,
+      body: String,
+      rejectRedirects: Boolean,
+    ) {
+      val call = ActiveHttpCall()
+      activeHttpCalls[reqId] = call
+      call.future = httpExecutor.submit {
+        executeNativeHttp(reqId, call, url, method, headersJson, hasBody, body, rejectRedirects)
+      }
+    }
+
+    @JavascriptInterface
+    fun abort(reqId: String) {
+      val call = activeHttpCalls.remove(reqId) ?: return
+      call.cancelled = true
+      call.future?.cancel(true)
+      val conn = call.connection
+      if (conn != null) {
+        try {
+          httpExecutor.execute {
+            try {
+              conn.disconnect()
+            } catch (_: Exception) {
+            }
+          }
+        } catch (_: Exception) {
+          try {
+            conn.disconnect()
+          } catch (_: Exception) {
+          }
+        }
       }
     }
   }
@@ -406,6 +767,7 @@ class MainActivity : TauriActivity() {
     webView.settings.mediaPlaybackRequiresUserGesture = false
     webView.settings.domStorageEnabled = true
     webView.addJavascriptInterface(NativeMediaBridge(), "CPlayerNativeMedia")
+    webView.addJavascriptInterface(NativeHttpBridge(), "CPlayerNativeHttp")
   }
 
   override fun onDestroy() {
@@ -414,6 +776,16 @@ class MainActivity : TauriActivity() {
     controllerFuture?.let { MediaController.releaseFuture(it) }
     controllerFuture = null
     mediaController = null
+    for (call in activeHttpCalls.values) {
+      call.cancelled = true
+      call.future?.cancel(true)
+      try {
+        call.connection?.disconnect()
+      } catch (_: Exception) {
+      }
+    }
+    activeHttpCalls.clear()
+    httpExecutor.shutdownNow()
     super.onDestroy()
   }
 }

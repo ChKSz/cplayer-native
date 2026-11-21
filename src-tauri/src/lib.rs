@@ -1,10 +1,17 @@
+#[cfg(not(target_os = "android"))]
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+#[cfg(not(target_os = "android"))]
 use reqwest::redirect::Policy;
+#[cfg(not(target_os = "android"))]
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "android"))]
 use std::collections::HashMap;
+#[cfg(not(target_os = "android"))]
 use std::str::FromStr;
+#[cfg(not(target_os = "android"))]
 use std::time::Duration;
 
+#[cfg(not(target_os = "android"))]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiFetchRequest {
@@ -16,6 +23,7 @@ struct ApiFetchRequest {
     reject_redirects: bool,
 }
 
+#[cfg(not(target_os = "android"))]
 #[derive(Debug, Serialize)]
 struct ApiFetchResponse {
     status: u16,
@@ -23,6 +31,7 @@ struct ApiFetchResponse {
     body: String,
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 async fn api_fetch(req: ApiFetchRequest) -> Result<ApiFetchResponse, String> {
     let parsed_url = reqwest::Url::parse(&req.url).map_err(|e| format!("无效请求地址: {e}"))?;
@@ -91,9 +100,12 @@ async fn api_fetch(req: ApiFetchRequest) -> Result<ApiFetchResponse, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_haptics::init())
-        .invoke_handler(tauri::generate_handler![api_fetch])
+    let builder = tauri::Builder::default().plugin(tauri_plugin_haptics::init());
+
+    #[cfg(not(target_os = "android"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![api_fetch]);
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running CPlayer Tauri application");
 }
